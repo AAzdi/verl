@@ -14,6 +14,8 @@
 # from . import gsm8k, math, prime_math, prime_code
 
 from verl.utils.import_utils import deprecated
+from deepscaler.rewards.math_reward import deepscaler_reward_fn
+from deepscaler.rewards.hf_math_reward import math_verify_reward_function
 
 
 def default_compute_score(
@@ -103,7 +105,8 @@ def default_compute_score(
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
     else:
-        raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
+        res = math_verify_reward_function(solution_str, ground_truth)
+        # raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
     if isinstance(res, dict):
         return res
