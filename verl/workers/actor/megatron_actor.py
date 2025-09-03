@@ -27,6 +27,7 @@ from typing import Iterable
 
 import torch
 import torch.distributed
+import torch.nn.functional as F
 from megatron.core import parallel_state as mpu
 
 # from megatron.core.optimizer import DistributedOptimizer
@@ -137,6 +138,19 @@ class MegatronPPOActor(BasePPOActor):
         config = get_model_config(self.actor_module[0])
         if torch.distributed.get_rank() == 0:
             print(config)
+        
+        # Router logits configuration
+        self.use_router_logits = self.config.get("use_router_logits", False)
+        self.use_router_kl_loss = self.config.get("use_router_kl_loss", False)
+        if torch.distributed.get_rank() == 0:
+            print(f"Router logits collection enabled: {self.use_router_logits}")
+            print(f"Router KL loss enabled: {self.use_router_kl_loss}")
+            if self.use_router_kl_loss and not self.use_router_logits:
+                print("WARNING: Router KL loss is enabled but router logits collection is disabled!")
+                print("Please set use_router_logits=True to enable router KL loss.")
+            if self.use_router_kl_loss:
+                print("NOTE: Router KL loss requires old_router_logits from previous iteration.")
+                print("      First training iteration will skip router KL loss.")
 
     def _validate_config(self, config) -> None:
         """Validate config options not implemented for Megatron backend"""
@@ -198,26 +212,31 @@ class MegatronPPOActor(BasePPOActor):
                 micro_batch_size=micro_batch_size,
                 max_token_len=max_token_len,
             )
+
+            # -------------------------
+            # Collect log_probs / entropy (last PP stage only)
+            # -------------------------
             if mpu.is_pipeline_last_stage(ignore_virtual=True):
-                # only on last rank. It should be on every tp rank
-                log_probs = [o["log_probs"] for o in output["output"]]  # (bs, seq_size)
+                micro_outputs = output["output"]
+                log_probs = [o["log_probs"] for o in micro_outputs]
                 log_probs = torch.cat(log_probs, dim=0).to(torch.float32)
-
                 if calculate_entropy:
-                    entropys = torch.cat([o["entropy"] for o in output["output"]], dim=0)
-                    entropys = entropys.to(torch.float32)
-
+                    entropys = torch.cat([o["entropy"] for o in micro_outputs], dim=0).to(torch.float32)
                 if use_dynamic_bsz:
-                    indices = output["indices"]
-                    indices = list(itertools.chain.from_iterable(indices))
-                    assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
-                    revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-                    log_probs = log_probs[revert_indices]
-                    if calculate_entropy:
-                        assert len(indices) == entropys.size(0), f"{len(indices)} vs. {entropys.size()}"
-                        entropys = entropys[revert_indices]
+                    indices = output.get("indices", None)
+                    if indices is not None:
+                        indices_flat = list(itertools.chain.from_iterable(indices))
+                        assert len(indices_flat) == log_probs.size(0), (
+                            f"{len(indices_flat)} vs. {log_probs.size()}"
+                        )
+                        revert_indices = torch.tensor(get_reverse_idx(indices_flat), dtype=torch.long)
+                        log_probs = log_probs[revert_indices]
+                        if calculate_entropy:
+                            assert len(indices_flat) == entropys.size(0), (
+                                f"{len(indices_flat)} vs. {entropys.size()}"
+                            )
+                            entropys = entropys[revert_indices]
             else:
-                # other pp ranks
                 log_probs = torch.empty(
                     size=(batch_size, response_length), dtype=torch.float32, device=input_ids.device
                 )
@@ -226,12 +245,103 @@ class MegatronPPOActor(BasePPOActor):
                         size=(batch_size, response_length), dtype=torch.float32, device=input_ids.device
                     )
 
+            # -------------------------
+            # Gather and aggregate router_logits across PP stages (only if enabled)
+            # -------------------------
+            if self.use_router_logits:
+                # Local partial shape: [B_micro, S, L_local, E]; concat micro-batches on batch dim first.
+                # Steps:
+                #   1. Concat local parts -> local_router [B_total, S, L_local, E] (or None)
+                #   2. Exchange (L_local, E) via all_gather (int tensor)
+                #   3. Pad local_router to max_L along layer dim -> send_buf [B_total, S, max_L, E_global]
+                #   4. all_gather padded tensors -> list; slice per-rank L_local and concat along layer dim
+                #   5. (Optional) reorder batch if dynamic_bsz
+                # Result: aggregated_router_logits [B_total, S, sum(L_local), E_global] or None
+                local_router_parts: list[torch.Tensor] = []
+                for mb_out in output["output"]:
+                    if isinstance(mb_out, dict):
+                        rl = mb_out.get("router_logits")
+                        if rl is not None:
+                            local_router_parts.append(rl)
+                local_router = torch.cat(local_router_parts, dim=0) if local_router_parts else None
+
+                pp_group = mpu.get_pipeline_model_parallel_group()
+                pp_world_size = torch.distributed.get_world_size(pp_group)
+                # ---------------- Router logits aggregation (keep log_probs/entropy logic unchanged) ----------------
+                if pp_world_size == 1:
+                    # Fast path: no communication for router logits
+                    aggregated_router_logits = local_router
+                    if (
+                        aggregated_router_logits is not None
+                        and use_dynamic_bsz
+                        and mpu.is_pipeline_last_stage(ignore_virtual=True)
+                        and indices is not None
+                    ):
+                        aggregated_router_logits = aggregated_router_logits[revert_indices]
+                else:
+                    # Meta gather for layer/expert dims
+                    # Assumption: all ranks have identical expert dimension E (user confirmed).
+                    # We only all_gather layer counts L_local; E obtained via all_reduce(max).
+                    if local_router is not None:
+                        B_total, S_total, L_local, E_global = local_router.shape
+                    else:
+                        B_total, S_total = input_ids.shape
+                        L_local, E_global = 0, 0
+                    # Gather layer counts
+                    L_local_tensor = torch.tensor([L_local], device=get_device_id(), dtype=torch.int32)
+                    L_list_tensors = [torch.zeros_like(L_local_tensor) for _ in range(pp_world_size)]
+                    torch.distributed.all_gather(L_list_tensors, L_local_tensor, group=pp_group)
+                    L_list = [int(t[0].item()) for t in L_list_tensors]
+                    # All-reduce expert dim (max) to cover cases where some stages have no MoE layers
+                    E_tensor = torch.tensor([E_global], device=get_device_id(), dtype=torch.int32)
+                    torch.distributed.all_reduce(E_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+                    E_global = int(E_tensor.item())
+                    L_max = max(L_list)
+
+                    if sum(L_list) == 0 or E_global == 0:
+                        aggregated_router_logits = None
+                    else:
+                        if local_router is None:
+                            send_buf = torch.zeros(
+                                (B_total, S_total, L_max, E_global), device=get_device_id(), dtype=torch.float32
+                            )
+                        else:
+                            if local_router.dtype != torch.float32:
+                                local_router = local_router.to(torch.float32)
+                            send_buf = torch.zeros(
+                                (B_total, S_total, L_max, E_global),
+                                device=local_router.device,
+                                dtype=local_router.dtype,
+                            )
+                            send_buf[:, :, :L_local, :E_global] = local_router
+
+                        gather_bufs = [torch.empty_like(send_buf) for _ in range(pp_world_size)]
+                        torch.distributed.all_gather(gather_bufs, send_buf, group=pp_group)
+
+                        layer_segments = []
+                        for rank_idx, buf in enumerate(gather_bufs):
+                            l_len = L_list[rank_idx]
+                            if l_len > 0:
+                                layer_segments.append(buf[:, :, :l_len, :E_global])
+                        aggregated_router_logits = torch.cat(layer_segments, dim=2) if layer_segments else None
+
+                        if (
+                            aggregated_router_logits is not None
+                            and use_dynamic_bsz
+                            and mpu.is_pipeline_last_stage(ignore_virtual=True)
+                            and indices is not None
+                        ):
+                            aggregated_router_logits = aggregated_router_logits[revert_indices]
+            else:
+                # Router logits collection disabled
+                aggregated_router_logits = None
+
+            # ---------------- Broadcast (unchanged for log_probs / entropy) ----------------
             log_probs = log_probs.to(get_device_id())
-            # broadcast across pp ranks
             torch.distributed.broadcast(
                 tensor=log_probs,
                 src=mpu.get_pipeline_model_parallel_last_rank(),
-                group=mpu.get_pipeline_model_parallel_group(),
+                group=pp_group,
                 async_op=False,
             )
             log_probs = log_probs.to("cpu")
@@ -241,15 +351,28 @@ class MegatronPPOActor(BasePPOActor):
                 torch.distributed.broadcast(
                     tensor=entropys,
                     src=mpu.get_pipeline_model_parallel_last_rank(),
-                    group=mpu.get_pipeline_model_parallel_group(),
+                    group=pp_group,
                     async_op=False,
                 )
                 entropys = entropys.to("cpu")
 
+            # Router logits broadcast - only if enabled
+            if self.use_router_logits and aggregated_router_logits is not None:
+                aggregated_router_logits = aggregated_router_logits.to(get_device_id())
+                torch.distributed.broadcast(
+                    tensor=aggregated_router_logits,
+                    src=mpu.get_pipeline_model_parallel_last_rank(),
+                    group=pp_group,
+                    async_op=False,
+                )
+                aggregated_router_logits = aggregated_router_logits.to("cpu")
+            elif not self.use_router_logits:
+                aggregated_router_logits = None
+
         # add empty cache after each compute
         get_torch_device().empty_cache()
 
-        return log_probs, entropys
+        return log_probs, entropys, aggregated_router_logits
 
     def make_minibatch_iterator(self, data: DataProto) -> Iterable[DataProto]:
         """Make minibatch iterator for updating the actor
@@ -288,6 +411,9 @@ class MegatronPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        # Add old_router_logits if router KL loss is enabled
+        if self.config.get("use_router_kl_loss", False):
+            select_keys.append("old_router_logits")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:
             data = data.select(select_keys, ["multi_modal_inputs"])
@@ -303,13 +429,17 @@ class MegatronPPOActor(BasePPOActor):
     def compute_ppo_loss(self, model_output, data):
         log_prob = model_output["log_probs"]
         entropy = model_output.get("entropy", None)
-
+        # get router logits
+        router_logits = model_output.get("router_logits", None)
         metrics = {}
 
         response_mask = data["response_mask"].to(bool)
         # compute policy loss
         old_log_prob = data["old_log_probs"]
         advantages = data["advantages"]
+
+        # get old router logits
+        old_router_logits = data.get("old_router_logits", None)
 
         loss_agg_mode = self.config.loss_agg_mode
 
@@ -345,13 +475,38 @@ class MegatronPPOActor(BasePPOActor):
         if self.config.use_kl_loss:
             ref_log_prob = data["ref_log_prob"]
             # compute kl loss
-            kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
-            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
+            if ref_log_prob is not None:
+                kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
+                if kld is not None:
+                    kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
+                    policy_loss += kl_loss * self.config.kl_loss_coef
+                    metrics["actor/kl_loss"] = kl_loss.detach().item()
+                    metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                else:
+                    if torch.distributed.get_rank() == 0:
+                        print("Warning: kl_penalty returned None, skipping KL loss")
+            else:
+                if torch.distributed.get_rank() == 0:
+                    print("Warning: ref_log_prob is None, skipping KL loss")
 
-            policy_loss += kl_loss * self.config.kl_loss_coef
-            metrics["actor/kl_loss"] = kl_loss.detach().item()
-            metrics["actor/kl_coef"] = self.config.kl_loss_coef
-
+        # add router kl loss
+        if self.config.use_router_kl_loss:
+            if router_logits is not None and old_router_logits is not None:
+                router_probs = F.log_softmax(router_logits, dim=-1)
+                old_router_probs = F.log_softmax(old_router_logits, dim=-1)
+                router_kl = kl_penalty(logprob=router_probs, ref_logprob=old_router_probs, kl_penalty="low_var_kl")
+                if router_kl is not None:
+                    router_kl_aggregated = router_kl.mean(dim=(2, 3))  # Average over layers and experts
+                    router_kl_loss = agg_loss(loss_mat=router_kl_aggregated, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
+                    policy_loss = policy_loss + router_kl_loss * self.config.router_kl_loss_coef
+                    metrics["actor/router_kl_loss"] = router_kl_loss.detach().item()
+                    metrics["actor/router_kl_coef"] = self.config.router_kl_loss_coef
+                else:
+                    if torch.distributed.get_rank() == 0:
+                        print("Warning: router kl_penalty returned None, skipping router KL loss")
+            else:
+                if torch.distributed.get_rank() == 0:
+                    print("Warning: router_logits or old_router_logits is None, skipping router KL loss")
         return policy_loss, metrics
 
     def forward_backward_batch(
@@ -430,7 +585,8 @@ class MegatronPPOActor(BasePPOActor):
             response_length = responses.size(1)
 
             log_prob = output["log_probs"][:, -response_length - 1 : -1].contiguous()
-            model_output = {"log_probs": log_prob}
+            router_logits = output["router_logits"][:, -response_length - 1 : -1].contiguous()
+            model_output = {"log_probs": log_prob, "router_logits": router_logits}
             if calculate_entropy:
                 entropy = output["entropy"][:, -response_length - 1 : -1].contiguous()
                 model_output["entropy"] = entropy
@@ -486,6 +642,7 @@ class MegatronPPOActor(BasePPOActor):
                     labels=label,
                     labels_mask=label_mask,
                     temperature=temperature,
+                    use_router_logits=self.use_router_logits,
                 )
             else:
                 forward_fn = get_mcore_forward_fn(self.hf_config)
@@ -522,6 +679,7 @@ class MegatronPPOActor(BasePPOActor):
                     multi_modal_inputs=multi_modal_inputs,
                     logits_processor=logits_processor,
                     logits_processor_args=logits_processor_args,
+                    use_router_logits=self.use_router_logits,
                 )
 
             return output, partial(loss_func, data=batch)
