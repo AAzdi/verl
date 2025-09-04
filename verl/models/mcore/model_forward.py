@@ -51,6 +51,7 @@ def gptmodel_forward(
             attention_mask=None,
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
+            use_router_logits=use_router_logits,
         )
 
         # Parse model output consistently across all pipeline stages
