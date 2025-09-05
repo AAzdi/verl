@@ -16,7 +16,14 @@
 
 from verl.utils.megatron_utils import unwrap_model
 
-from .util import postprocess_packed_seqs, preprocess_packed_seqs, recover_left_padding, remove_left_padding
+from .util import (
+    postprocess_packed_seqs,
+    preprocess_packed_seqs,
+    recover_left_padding,
+    remove_left_padding,
+    postprocess_packed_router_logits,
+    recover_left_padding_router_logits,
+)
 
 
 def gptmodel_forward(
@@ -29,6 +36,7 @@ def gptmodel_forward(
     pack_seqs=True,
     logits_processor=None,
     logits_processor_args: dict = None,
+    use_router_logits=False,
     **kwargs,
 ):
     """Default forward pass for GPT models with optional sequence packing."""
@@ -38,12 +46,22 @@ def gptmodel_forward(
         batch_size, seq_len = attention_mask.shape[:2]
         input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=pre_process)
         input_ids_rmpad = input_ids_rmpad.contiguous()
-        output_orig = model(
+        model_output = model(
             input_ids=input_ids_rmpad,
             attention_mask=None,
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
+            use_router_logits=use_router_logits,
         )
+
+        # Parse model output consistently across all pipeline stages
+        if use_router_logits and isinstance(model_output, tuple) and len(model_output) == 2:
+            output_orig, router_logits_raw = model_output
+        else:
+            output_orig = model_output
+            router_logits_raw = None
+
+        # Process primary output (log_probs etc.)
         if post_process and logits_processor is not None:
             args = {
                 k: preprocess_packed_seqs(v, attention_mask, pre_process=True)[0]
@@ -60,18 +78,57 @@ def gptmodel_forward(
             output = postprocess_packed_seqs(
                 output_orig, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
             )
+
+        # Router logits postprocess (packed -> padded) - only if enabled
+        if use_router_logits:
+            router_logits = postprocess_packed_router_logits(
+                router_logits_raw, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+            )
+        else:
+            router_logits = None
     else:
         assert logits_processor is None, "logits_processor is not supported for non-packed sequence"
         batch_size, sequence_length = attention_mask.shape
         new_input_ids, new_attention_mask, new_position_ids = remove_left_padding(
             input_ids, attention_mask, position_ids, sequence_parallel, pre_process=pre_process
         )
-        output = model(input_ids=new_input_ids, attention_mask=new_attention_mask, position_ids=new_position_ids)
+        model_output = model(input_ids=new_input_ids, attention_mask=new_attention_mask, position_ids=new_position_ids)
+        
+        # Parse model output consistently across all pipeline stages
+        if use_router_logits and isinstance(model_output, tuple) and len(model_output) == 2:
+            output_orig, router_logits_raw = model_output
+        else:
+            output_orig = model_output
+            router_logits_raw = None
+
+        # recover main output
         output = recover_left_padding(
-            output, new_attention_mask, attention_mask, sequence_length, post_process=post_process
+            output_orig, new_attention_mask, attention_mask, sequence_length, post_process=post_process
         )
+        # router logits recover - only if enabled
+        if use_router_logits:
+            router_logits = recover_left_padding_router_logits(
+                router_logits_raw, new_attention_mask, attention_mask, sequence_length, post_process=post_process
+            )
+        else:
+            router_logits = None
     if value_model and post_process:
         output = output[..., 0]
+    # Attach router_logits to output (dict or tensor). Ensure unified return type
+    if isinstance(output, dict):
+        if use_router_logits:
+            output["router_logits"] = router_logits
+        # Don't add router_logits key if use_router_logits=False
+    else:  # tensor output path (unlikely when logits_processor used)
+        if use_router_logits:
+            output = {"log_probs": output, "router_logits": router_logits}
+        else:
+            output = {"log_probs": output}
+    
+    # if use_router_logits:
+    #     print(
+    #         f"log_probs shape: {output['log_probs'].shape if 'log_probs' in output else None}, Router logits shape: {output['router_logits'].shape if 'router_logits' in output else None}"
+    #     )
     return output
 
 

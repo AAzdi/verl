@@ -162,6 +162,44 @@ def postprocess_packed_seqs(
     return output_new
 
 
+def postprocess_packed_router_logits(
+    router_logits: torch.Tensor | None,
+    packed_seq_params: PackedSeqParams,
+    attention_mask: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    post_process: bool = True,
+) -> torch.Tensor | None:
+    """Postprocess packed router logits to padded (left-padded) layout.
+
+    Supported packed input layouts:
+      1) legacy: [B_router(=1), L, T_active, E]
+      2) token-major (preferred): [B_router(=1), T_active, L, E]
+
+    Returned padded layout: [batch_size, seq_len, L, E]
+    """
+    if router_logits is None:
+        return None
+    if router_logits.ndim != 4:
+        raise ValueError(
+            f"router_logits expected 4D, got shape {tuple(router_logits.shape)}"
+        )
+    # Detect whether second dim already token-major by simple heuristic: choose the dim whose size
+    # matches packed_seq_params.cu_seqlens_q_padded[-1] (total packed tokens)
+    total_packed = int(packed_seq_params.cu_seqlens_q_padded[-1].item())
+    if router_logits.shape[1] == total_packed:  # already [B, T_active, L, E]
+        rl_reordered = router_logits
+    elif router_logits.shape[2] == total_packed:  # legacy [B, L, T_active, E]
+        rl_reordered = router_logits.permute(0, 2, 1, 3).contiguous()
+    else:
+        # Fallback: assume legacy
+        rl_reordered = router_logits.permute(0, 2, 1, 3).contiguous()
+    rl_padded = postprocess_packed_seqs(
+        rl_reordered, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+    )
+    return rl_padded
+
+
 def remove_left_padding(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -223,6 +261,33 @@ def recover_left_padding(
     for i in range(batch_size):
         new_result[i, original_attention_mask[i]] = result[i, attention_mask[i]]
     return new_result
+
+
+def recover_left_padding_router_logits(
+    router_logits: torch.Tensor | None,
+    new_attention_mask: torch.Tensor,
+    original_attention_mask: torch.Tensor,
+    origin_seqlen: int,
+    post_process: bool = True,
+):
+    """Recover left padding for router logits in non-packed path.
+
+    Input router_logits shape (trimmed): [B, L, S_trim, E]
+    Output shape (padded): [B, origin_seqlen, L, E]
+    We transpose to put sequence dim second so we can reuse recover_left_padding.
+    """
+    if router_logits is None:
+        return None
+    if router_logits.ndim != 4:
+        raise ValueError(
+            f"router_logits expected 4D [B, L, S_trim, E], got shape {tuple(router_logits.shape)}"
+        )
+    # Reorder to [B, S_trim, L, E]
+    rl_reordered = router_logits.permute(0, 2, 1, 3).contiguous()
+    rl_padded = recover_left_padding(
+        rl_reordered, new_attention_mask, original_attention_mask, origin_seqlen, post_process=post_process
+    )  # [B, origin_seqlen, L, E]
+    return rl_padded
 
 
 def postprocess_packed_seqs_for_dict_output(

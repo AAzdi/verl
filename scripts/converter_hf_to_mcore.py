@@ -441,7 +441,7 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
     model_parallel_cuda_manual_seed(0)
 
     # init hf config
-    hf_config = AutoConfig.from_pretrained(hf_model_path)
+    hf_config = AutoConfig.from_pretrained(hf_model_path, trust_remote_code=trust_remote_code)
     print(hf_config, flush=True)
 
     if world_size > 1 and not support_distributed_convert(hf_config):
