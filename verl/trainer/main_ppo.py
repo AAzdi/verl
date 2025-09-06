@@ -62,6 +62,29 @@ def run_ppo(config) -> None:
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        # If using local ray (no 'address') and user didn't set object_store_memory,
+        # set it to half of /dev/shm to better utilize shared memory.
+        try:
+            has_address = bool(ray_init_kwargs.get("address"))
+        except Exception:
+            has_address = False
+
+        try:
+            has_obj_store_mem = (
+                "object_store_memory" in ray_init_kwargs and ray_init_kwargs.get("object_store_memory") is not None
+            )
+        except Exception:
+            has_obj_store_mem = False
+
+        if not has_address and not has_obj_store_mem:
+            try:
+                st = os.statvfs("/dev/shm")
+                total_bytes = int(st.f_frsize) * int(st.f_blocks)
+                half_shm = max(int(total_bytes // 2), 0)
+                ray_init_kwargs["object_store_memory"] = half_shm
+                print(f"[Ray] object_store_memory set to half of /dev/shm: {half_shm} bytes")
+            except Exception as e:
+                print(f"[Ray] Skip setting object_store_memory from /dev/shm: {e}")
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
