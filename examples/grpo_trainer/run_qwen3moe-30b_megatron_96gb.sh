@@ -1,41 +1,41 @@
 set -x
 
 # tested in NNODES=1~4 * 96G H20 GPU
-NNODES=${NNODES:-1}
+NNODES=${NNODES:-2}
 NGPUS_PER_NODES=${NGPUS_PER_NODES:-8}
 
-project_name='DAPO-Qwen3-30b-MATH'
-exp_name='DAPO-Qwen3-30b-MATH-megatron'
+project_name='MoE-TTS-Qwen'
+exp_name='Qwen3-MoE-8k-deepscaler-GSPO-clip-6e-5-8e-5-save-test-mi300'
 
 adv_estimator=grpo
+loss_mode=gspo
 
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
 
-clip_ratio_low=0.2
-clip_ratio_high=0.28
-max_prompt_length=$((1024 * 2))
+clip_ratio_low=3e-5
+clip_ratio_high=4e-5
+max_prompt_length=$((1024 * 1))
 max_response_length=$((1024 * 8))
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 
-loss_agg_mode="token-mean"
+loss_agg_mode="seq-mean-token-mean"
 
-train_prompt_bsz=512
-n_resp_per_prompt=16
-train_prompt_mini_bsz=128
-train_ppo_micro_batch_size_per_gpu=2
-infer_ppo_micro_batch_size_per_gpu=2
+train_prompt_bsz=128
+n_resp_per_prompt=8
+train_prompt_mini_bsz=64
+train_ppo_micro_batch_size_per_gpu=1
+infer_ppo_micro_batch_size_per_gpu=1
 # Paths
-MODEL_PATH=Qwen/Qwen3-30B-A3B
+MODEL_PATH=/mnt/msranlp/xun/reasoning/MoE-TTS/cpkts/Qwen3/Qwen3-30B-A3B
+DIST_CKPT_PATH=/mnt/msranlp/xun/reasoning/MoE-TTS/cpkts/Qwen3/Qwen3-30B-A3B-mcore
 
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-TRAIN_FILE=$RAY_DATA_HOME/dataset/dapo-math-17k.parquet
-TEST_FILE=$RAY_DATA_HOME/dataset/aime-2024.parquet
-TEST_FILE="['$aime24_test_path']"
+TRAIN_FILE="['./deepscaler/hdfs_data/train.parquet']"
+TEST_FILE="['./deepscaler/hdfs_data/math.parquet']"
 
 # Algorithm
 temperature=1.0
@@ -51,11 +51,11 @@ offload=True
 
 optimizer_offload_fraction=${OFFLOAD_FRACTION:-1.}
 
-COMMON_PP=${COMMON_PP:-1}
+COMMON_PP=${COMMON_PP:-2}
 COMMON_VPP=${COMMON_VPP:-null}
 COMMON_CP=${COMMON_CP:-1}
-COMMON_TP=${COMMON_TP:-1}
-COMMON_EP=${COMMON_EP:-8}
+COMMON_TP=${COMMON_TP:-2}
+COMMON_EP=${COMMON_EP:-4}
 COMMON_ETP=${COMMON_ETP:-1}
 
 TRAIN_TP=${TRAIN_TP:-$COMMON_TP}
@@ -112,6 +112,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
     +actor_rollout_ref.model.override_config.model_config.max_position_embeddings=$((max_prompt_length + max_response_length)) \
     actor_rollout_ref.model.use_fused_kernels=False \
+    actor_rollout_ref.actor.policy_loss.loss_mode=${loss_mode} \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${train_ppo_micro_batch_size_per_gpu} \
@@ -126,6 +127,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True \
     actor_rollout_ref.actor.megatron.use_mbridge=$USE_MBRIDGE \
     actor_rollout_ref.actor.megatron.use_dist_checkpointing=$USE_DIST_CKPT \
+    actor_rollout_ref.actor.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     actor_rollout_ref.actor.megatron.param_offload=${offload} \
     actor_rollout_ref.actor.megatron.grad_offload=${offload} \
     actor_rollout_ref.actor.megatron.optimizer_offload=${offload} \
@@ -135,23 +137,11 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
     actor_rollout_ref.actor.megatron.context_parallel_size=${ACTOR_CP} \
     actor_rollout_ref.actor.megatron.expert_model_parallel_size=${ACTOR_EP} \
     actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${ACTOR_ETP} \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.masked_softmax_fusion=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.bias_activation_fusion=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.bias_dropout_fusion=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.deallocate_pipeline_outputs=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.persist_layer_norm=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type="flex" \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_enable_deepep=True \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${infer_ppo_micro_batch_size_per_gpu} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${INFER_TP} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
@@ -176,12 +166,6 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
     actor_rollout_ref.ref.megatron.context_parallel_size=${REF_CP} \
     actor_rollout_ref.ref.megatron.expert_model_parallel_size=${REF_EP} \
     actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${REF_ETP} \
-    reward_model.reward_manager=dapo \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
@@ -189,7 +173,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=False \
     trainer.test_freq=10 \
-    trainer.save_freq=100 \
+    trainer.save_freq=500 \
     trainer.total_epochs=10 \
     trainer.resume_mode=auto \
     trainer.log_val_generations=10
