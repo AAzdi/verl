@@ -162,6 +162,78 @@ def postprocess_packed_seqs(
     return output_new
 
 
+def postprocess_packed_seqs_router_safe(
+    output: torch.Tensor,
+    packed_seq_params: PackedSeqParams,
+    attention_mask: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    post_process: bool = True,
+) -> torch.Tensor:
+    """
+    Postprocess packed sequences specifically for router logits.
+    
+    Input: [bsz, packed_seq_len, layers, expert_num]
+    Output: [batch_size, seq_len, layers, expert_num]
+    """
+    if not post_process:
+        return output
+
+    cu_padded_cpu: list[int] = packed_seq_params.cu_seqlens_q_padded.tolist()
+    seq_lens_cpu: list[int] = attention_mask.sum(dim=1, dtype=torch.int32).cpu().tolist()
+
+    # Shape: [batch_size, seq_len, layers, expert_num]
+    shape = [batch_size, seq_len] + list(output.shape[2:])
+    output_new = torch.zeros(shape, dtype=output.dtype, device=output.device)
+
+    cp_size = mpu.get_context_parallel_world_size()
+    
+    # Handle context parallel gathering if needed
+    if cp_size > 1:
+        output_list = [torch.empty_like(output) for _ in range(cp_size)]
+        torch.distributed.all_gather(output_list, output.detach(), group=mpu.get_context_parallel_group())
+        output_list[mpu.get_context_parallel_rank()] = output
+    else:
+        output_list = [output]
+    
+    for i in range(batch_size):
+        if cp_size <= 1:
+            s = seq_lens_cpu[i]
+            start_idx = cu_padded_cpu[i]
+            
+            # Simple and direct assignment for router logits
+            available_tokens = min(s, output[0].shape[0] - start_idx)
+            if available_tokens > 0:
+                target_indices = torch.where(attention_mask[i])[0][:available_tokens]
+                output_new[i, target_indices] = output[0][start_idx : start_idx + available_tokens]
+            continue
+            
+        # Handle CP > 1 case with chunked processing
+        s_len_padded_chunk = (cu_padded_cpu[i + 1] - cu_padded_cpu[i]) // cp_size
+        half_seqlen = s_len_padded_chunk // 2
+        s_len = seq_lens_cpu[i]
+        s_len_padded = s_len_padded_chunk * cp_size
+        tmp = torch.empty(s_len_padded, *output.shape[2:], device=output.device)
+        
+        for j in range(cp_size):
+            o = output_list[j][0]
+            packed_start_idx = cu_padded_cpu[i] // cp_size
+            o0, o1 = (
+                o[packed_start_idx : packed_start_idx + half_seqlen],
+                o[packed_start_idx + half_seqlen : packed_start_idx + s_len_padded_chunk],
+            )
+            tmp[j * half_seqlen : (j + 1) * half_seqlen] = o0
+            tmp[s_len_padded - (j + 1) * half_seqlen : s_len_padded - j * half_seqlen] = o1
+        
+        # Safe assignment for the final result
+        target_indices = torch.where(attention_mask[i])[0]
+        copy_len = min(s_len, len(target_indices), tmp.shape[0])
+        if copy_len > 0:
+            output_new[i, target_indices[:copy_len]] = tmp[:copy_len]
+
+    return output_new
+
+
 def postprocess_packed_router_logits(
     router_logits: torch.Tensor | None,
     packed_seq_params: PackedSeqParams,
@@ -172,30 +244,23 @@ def postprocess_packed_router_logits(
 ) -> torch.Tensor | None:
     """Postprocess packed router logits to padded (left-padded) layout.
 
-    Supported packed input layouts:
-      1) legacy: [B_router(=1), L, T_active, E]
-      2) token-major (preferred): [B_router(=1), T_active, L, E]
-
-    Returned padded layout: [batch_size, seq_len, L, E]
+    Input router_logits shape: [bsz, seq_len_packed, layers, expert_num]
+    Output padded layout: [batch_size, seq_len, layers, expert_num]
+    
+    Note: Router logits are already in the correct dimensional order,
+    we just need to unpack from the packed sequence format.
     """
     if router_logits is None:
         return None
     if router_logits.ndim != 4:
         raise ValueError(
-            f"router_logits expected 4D, got shape {tuple(router_logits.shape)}"
+            f"router_logits expected 4D [bsz, seq_len_packed, layers, expert_num], got shape {tuple(router_logits.shape)}"
         )
-    # Detect whether second dim already token-major by simple heuristic: choose the dim whose size
-    # matches packed_seq_params.cu_seqlens_q_padded[-1] (total packed tokens)
-    total_packed = int(packed_seq_params.cu_seqlens_q_padded[-1].item())
-    if router_logits.shape[1] == total_packed:  # already [B, T_active, L, E]
-        rl_reordered = router_logits
-    elif router_logits.shape[2] == total_packed:  # legacy [B, L, T_active, E]
-        rl_reordered = router_logits.permute(0, 2, 1, 3).contiguous()
-    else:
-        # Fallback: assume legacy
-        rl_reordered = router_logits.permute(0, 2, 1, 3).contiguous()
-    rl_padded = postprocess_packed_seqs(
-        rl_reordered, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+    
+    # Since router_logits are already in [bsz, seq_len_packed, layers, expert_num] format,
+    # we can directly use the standard postprocessing with proper shape handling
+    rl_padded = postprocess_packed_seqs_router_safe(
+        router_logits, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
     )
     return rl_padded
 
@@ -272,21 +337,40 @@ def recover_left_padding_router_logits(
 ):
     """Recover left padding for router logits in non-packed path.
 
-    Input router_logits shape (trimmed): [B, L, S_trim, E]
-    Output shape (padded): [B, origin_seqlen, L, E]
-    We transpose to put sequence dim second so we can reuse recover_left_padding.
+    Input router_logits shape: [batch_size, trimmed_seq_len, layers, expert_num]
+    Output shape: [batch_size, origin_seqlen, layers, expert_num]
     """
     if router_logits is None:
         return None
+    if not post_process:
+        return router_logits
     if router_logits.ndim != 4:
         raise ValueError(
-            f"router_logits expected 4D [B, L, S_trim, E], got shape {tuple(router_logits.shape)}"
+            f"router_logits expected 4D [batch_size, trimmed_seq_len, layers, expert_num], got shape {tuple(router_logits.shape)}"
         )
-    # Reorder to [B, S_trim, L, E]
-    rl_reordered = router_logits.permute(0, 2, 1, 3).contiguous()
-    rl_padded = recover_left_padding(
-        rl_reordered, new_attention_mask, original_attention_mask, origin_seqlen, post_process=post_process
-    )  # [B, origin_seqlen, L, E]
+    
+    batch_size, trimmed_seq_len, num_layers, num_experts = router_logits.shape
+    
+    # Create output tensor with correct padded shape
+    rl_padded = torch.zeros(
+        (batch_size, origin_seqlen, num_layers, num_experts),
+        dtype=router_logits.dtype,
+        device=router_logits.device
+    )
+    
+    # Process each batch
+    for b in range(batch_size):
+        # Get valid positions in both masks
+        new_valid_pos = torch.where(new_attention_mask[b])[0]
+        orig_valid_pos = torch.where(original_attention_mask[b])[0]
+        
+        # Determine how much we can safely copy
+        copy_len = min(len(new_valid_pos), len(orig_valid_pos), trimmed_seq_len)
+        
+        if copy_len > 0:
+            # Direct copy since dimensions are already aligned
+            rl_padded[b, orig_valid_pos[:copy_len], :, :] = router_logits[b, :copy_len, :, :]
+    
     return rl_padded
 
 
