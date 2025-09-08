@@ -523,17 +523,15 @@ class MegatronPPOActor(BasePPOActor):
         - The model takes input: (input_ids, attention_mask, position_ids). No rmpad for the input
         - The communication shape is (total_nnz_pad_to_sp // tp_size, 1, hidden_size) if sequence parallel is enabled
         """
-        # broadcast from last pp rank to all other pp ranks
-        # TODO: actually, we just need to control the sampling order.
-        data.to(get_device_id())
-        data.batch = data.batch.contiguous()
+        # data.to(get_device_id())
+        # data.batch = data.batch.contiguous()
         mini_batch = data
-        broadcast_dict_tensor(
-            mini_batch.batch,
-            src=mpu.get_pipeline_model_parallel_last_rank(),
-            group=mpu.get_pipeline_model_parallel_group(),
-        )
-        mini_batch.to("cpu")
+        # broadcast_dict_tensor(
+        #     mini_batch.batch,
+        #     src=mpu.get_pipeline_model_parallel_last_rank(),
+        #     group=mpu.get_pipeline_model_parallel_group(),
+        # )
+        # mini_batch.to("cpu")
         # split into micro-batches
         mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
         self.has_multi_modal_inputs = "multi_modal_inputs" in mini_batch.non_tensor_batch.keys()
