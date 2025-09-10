@@ -106,6 +106,7 @@ class ActorConfig(BaseConfig):
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0
     tis_imp_ratio_cap: float = -1
+    use_router_shift: bool = False
     use_router_kl_loss: bool = False
     router_kl_loss_coef: float = 1.0
     use_router_logits: bool = False
