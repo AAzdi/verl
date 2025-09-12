@@ -24,6 +24,7 @@ from .util import (
     remove_left_padding,
     postprocess_packed_router_logits,
     recover_left_padding_router_logits,
+    postprocess_packed_main_and_router,
 )
 
 
@@ -47,7 +48,6 @@ def gptmodel_forward(
         batch_size, seq_len = attention_mask.shape[:2]
         input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=pre_process)
         input_ids_rmpad = input_ids_rmpad.contiguous()
-        print_timing("model_forward:Start megatron model forward")
         model_output = model(
             input_ids=input_ids_rmpad,
             attention_mask=None,
@@ -55,8 +55,6 @@ def gptmodel_forward(
             packed_seq_params=packed_seq_params,
             use_router_logits=use_router_logits,
         )
-        print_timing("model_forward:Finished megatron model forward")
-
         # Parse model output consistently across all pipeline stages
         if use_router_logits and isinstance(model_output, tuple) and len(model_output) == 2:
             output_orig, router_logits_raw = model_output
@@ -64,33 +62,17 @@ def gptmodel_forward(
             output_orig = model_output
             router_logits_raw = None
 
-        # Process primary output (log_probs etc.)
+        # Unified unpack for main + router logits
         if post_process and logits_processor is not None:
-            args = {
-                k: preprocess_packed_seqs(v, attention_mask, pre_process=True)[0]
-                for k, v in logits_processor_args.items()
-            }
+            args = {k: preprocess_packed_seqs(v, attention_mask, pre_process=True)[0] for k, v in logits_processor_args.items()}
             output_dict = logits_processor(output_orig, **args)
-            output = {
-                k: postprocess_packed_seqs(
-                    v, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
-                )
-                for k, v in output_dict.items()
-            }
-        else:
-            output = postprocess_packed_seqs(
-                output_orig, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+            output, router_logits = postprocess_packed_main_and_router(
+                output_dict, router_logits_raw, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
             )
-
-        # Router logits postprocess (packed -> padded) - only if enabled
-        if use_router_logits:
-            print_timing("model_forward:Start postprocess router logits")
-            router_logits = postprocess_packed_router_logits(
-                router_logits_raw, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
-            )
-            print_timing("model_forward:Finished postprocess router logits") 
         else:
-            router_logits = None
+            output, router_logits = postprocess_packed_main_and_router(
+                output_orig, router_logits_raw, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+            )
     else:
         assert logits_processor is None, "logits_processor is not supported for non-packed sequence"
         batch_size, sequence_length = attention_mask.shape
@@ -130,10 +112,10 @@ def gptmodel_forward(
         else:
             output = {"log_probs": output}
     
-    # if use_router_logits:
-    #     print(
-    #         f"log_probs shape: {output['log_probs'].shape if 'log_probs' in output else None}, Router logits shape: {output['router_logits'].shape if 'router_logits' in output else None}"
-    #     )
+    if use_router_logits:
+        print(
+            f"log_probs shape: {output['log_probs'].shape if 'log_probs' in output else None}, Router logits shape: {output['router_logits'].shape if 'router_logits' in output else None}"
+        )
     return output
 
 

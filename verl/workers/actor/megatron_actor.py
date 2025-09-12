@@ -46,7 +46,6 @@ from verl.utils.profiler.profile import Profiler
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
-from verl.utils.timing_debug import print_timing, context_timer, timing_decorator
 from verl.workers.actor import BasePPOActor
 
 __all__ = ["MegatronPPOActor"]
@@ -184,7 +183,6 @@ class MegatronPPOActor(BasePPOActor):
         Returns:
             DataProto: torch.Tensor: the log_prob tensor
         """
-        print_timing("megatron_actor:Starting compute_log_prob")
         use_dynamic_bsz = data.meta_info.get("use_dynamic_bsz", False)
         micro_batch_size = data.meta_info.get("micro_batch_size", None)
         max_token_len = data.meta_info.get("max_token_len", None)
@@ -208,7 +206,6 @@ class MegatronPPOActor(BasePPOActor):
         response = batch["responses"]
         response_length = response.size(1)
         with torch.no_grad():
-            print_timing("Starting forward_backward_batch")
             output = self.forward_backward_batch(
                 data,
                 forward_only=True,
@@ -217,7 +214,6 @@ class MegatronPPOActor(BasePPOActor):
                 micro_batch_size=micro_batch_size,
                 max_token_len=max_token_len,
             )
-            print_timing("Finished forward_backward_batch")
 
             # -------------------------
             # Collect log_probs / entropy (last PP stage only)
@@ -272,7 +268,12 @@ class MegatronPPOActor(BasePPOActor):
                         rl = mb_out.get("router_logits")
                         if rl is not None:
                             local_router_parts.append(rl)
+                            # Clean up the reference in mb_out to save memory
+                            del mb_out["router_logits"]
+                
                 local_router = torch.cat(local_router_parts, dim=0) if local_router_parts else None
+                # Clean up the parts list
+                del local_router_parts
 
                 
                 # ---------------- Router logits aggregation (keep log_probs/entropy logic unchanged) ----------------
@@ -329,12 +330,22 @@ class MegatronPPOActor(BasePPOActor):
                         gather_bufs = [torch.empty_like(send_buf) for _ in range(pp_world_size)]
                         torch.distributed.all_gather(gather_bufs, send_buf, group=pp_group)
 
+                        # Clean up send_buf immediately after all_gather
+                        del send_buf
+                        
                         layer_segments = []
                         for rank_idx, buf in enumerate(gather_bufs):
                             l_len = L_list[rank_idx]
                             if l_len > 0:
                                 layer_segments.append(buf[:, :, :l_len, :E_global])
+                        
+                        # Clean up gather_bufs after extracting segments
+                        del gather_bufs
+                        
                         aggregated_router_logits = torch.cat(layer_segments, dim=2) if layer_segments else None
+                        
+                        # Clean up layer_segments
+                        del layer_segments
 
                         if (
                             aggregated_router_logits is not None
@@ -385,7 +396,6 @@ class MegatronPPOActor(BasePPOActor):
 
         # add empty cache after each compute
         get_torch_device().empty_cache()
-        print_timing("megatron_actor:Finished compute_log_prob")
 
         return log_probs, entropys, aggregated_router_logits
 
@@ -426,8 +436,11 @@ class MegatronPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-        # Add old_router_logits if router KL loss is enabled
-        if self.config.get("use_router_logits", False):
+        # Add old_router_logits only if router-based features are actually used
+        if self.config.get("use_router_logits", False) and (
+            self.config.get("use_router_shift", False) or 
+            self.config.get("use_router_kl_loss", False)
+        ):
             select_keys.append("old_router_logits")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:
@@ -453,56 +466,83 @@ class MegatronPPOActor(BasePPOActor):
         old_log_prob = data["old_log_probs"]
         advantages = data["advantages"]
 
-        # get old router logits
+        # get old router logits - should now be directly available in data after minibatch processing
         old_router_logits = data.get("old_router_logits", None)
+        
+        # Memory optimization: only move to GPU and keep in memory when actually needed
+        if old_router_logits is not None:
+            need_router_computation = (
+                self.config.get("use_router_shift", False) or 
+                self.config.get("use_router_kl_loss", False)
+            )
+            
+            if need_router_computation:
+                # Move to GPU only when needed for computation
+                old_router_logits = old_router_logits.to(log_prob.device)
+            else:
+                # If not needed for computation, remove immediately to save memory
+                old_router_logits = None
+                
+            # Remove from data dict to free memory immediately after extraction
+            if "old_router_logits" in data:
+                del data["old_router_logits"]
 
         loss_agg_mode = self.config.loss_agg_mode
 
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-        # add router ratio - memory optimized version
-        if self.config.get("use_router_shift", False):
-            # Memory optimization: avoid creating full softmax matrices
+        # add router ratio - memory optimized version with aggressive cleanup
+        router_shift_geometric_mean = None
+        if self.config.get("use_router_shift", False) and old_router_logits is not None and router_logits is not None:
+            # Memory optimization: avoid creating full softmax matrices and use streaming computation
             with torch.no_grad():  # Router shift calculation doesn't need gradients
-                # Step 1: Get top-k from old router logits efficiently
-                old_topk_logits, topk_indices = torch.topk(old_router_logits, 8, dim=-1)
-                old_topk_scores = F.softmax(old_topk_logits, dim=-1)  # Only softmax top-k values
+                eps = 1e-8
                 
+                # Step 1: Get top-k from old router logits efficiently (reduce k if memory is tight)
+                k_experts = min(8, old_router_logits.size(-1))  # Adaptive k based on available experts
+                old_topk_logits, topk_indices = torch.topk(old_router_logits, k_experts, dim=-1)
+                old_topk_scores = F.softmax(old_topk_logits, dim=-1)
+                          
                 # Step 2: Extract corresponding logits from current router and compute softmax
                 selected_router_logits = torch.gather(router_logits, dim=-1, index=topk_indices)
                 selected_router_scores = F.softmax(selected_router_logits, dim=-1)
                 
-                # Step 3: Compute shift with numerical stability (add small epsilon)
-                eps = 1e-8
+                # Clean up intermediate tensors
+                del selected_router_logits, topk_indices
+                
+                # Step 3: Compute shift with numerical stability
                 router_shift = (selected_router_scores - old_topk_scores).abs() / (old_topk_scores + eps)
                 router_shift = 1 - router_shift
                 
-                # Step 4: Memory-efficient aggregation using chunked processing if needed
-                if router_shift.numel() > 1e7:  # If tensor is large (>10M elements)
-                    # Process in chunks to reduce peak memory
-                    chunk_size = router_shift.size(0) // 4 + 1
-                    shift_means = []
-                    for i in range(0, router_shift.size(0), chunk_size):
-                        chunk = router_shift[i:i+chunk_size]
-                        chunk_mean = chunk.mean(dim=-1)  # [chunk_bsz, max_resp_len]
-                        shift_means.append(chunk_mean)
-                    router_shift_mean = torch.cat(shift_means, dim=0)
-                else:
-                    router_shift_mean = router_shift.mean(dim=-1)  # [bsz, max_resp_len]
+                # Step 4: Streaming aggregation to minimize peak memory usage
+                router_shift_mean = router_shift.mean(dim=-1)  # [bsz, max_resp_len]
+
                 
-                # Step 5: Geometric mean calculation with log-space for numerical stability
+                # Step 5: Log-space geometric mean calculation for numerical stability
                 log_shift = torch.log(torch.clamp(router_shift_mean, min=eps))
+
                 log_geom_mean = log_shift.mean(dim=-1)  # [bsz, max_resp_len]
                 router_shift_geometric_mean = torch.exp(log_geom_mean)  # [bsz, max_resp_len]
+
                 
-                # Clean up intermediate tensors
-                del old_topk_logits, old_topk_scores, selected_router_logits, selected_router_scores
-                del router_shift, log_shift, log_geom_mean
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 
-            # Use response_mask directly since router_shift_geometric_mean now has shape [bsz, max_resp_len]
+        # Calculate router shift ratio only if we actually computed it
+        if router_shift_geometric_mean is not None:
+            # Compute mean router shift ratio using aggregation function
             router_shift_ratio = agg_loss(loss_mat=router_shift_geometric_mean, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
             metrics["actor/router_shift_ratio"] = router_shift_ratio.detach().item()
+            
+            # Compute additional statistics: max and min values
+            # Apply response mask to get valid values only
+            masked_values = router_shift_geometric_mean * response_mask.float()
+            valid_values = masked_values[response_mask]  # Extract only valid (non-masked) values
+            
+            if valid_values.numel() > 0:  # Ensure we have valid values
+                router_shift_max = valid_values.max().detach().item()
+                router_shift_min = valid_values.min().detach().item()
+                
+                metrics["actor/router_shift_ratio_max"] = router_shift_max
+                metrics["actor/router_shift_ratio_min"] = router_shift_min
 
         policy_loss_fn = get_policy_loss_fn(loss_mode)
         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
@@ -515,6 +555,10 @@ class MegatronPPOActor(BasePPOActor):
             router_shift_geometric_mean=router_shift_geometric_mean if self.config.get("use_router_shift", False) else None,
             config=self.config,
         )
+        
+        # Clean up router shift tensor after policy loss calculation
+        if router_shift_geometric_mean is not None:
+            del router_shift_geometric_mean
 
         metrics.update(
             {
@@ -554,21 +598,80 @@ class MegatronPPOActor(BasePPOActor):
         # add router kl loss
         if self.config.use_router_kl_loss:
             if router_logits is not None and old_router_logits is not None:
-                router_probs = F.log_softmax(router_logits, dim=-1)
-                old_router_probs = F.log_softmax(old_router_logits, dim=-1)
-                router_kl = kl_penalty(logprob=router_probs, ref_logprob=old_router_probs, kl_penalty="low_var_kl")
+                # Memory optimized router KL computation with chunked processing for large tensors
+                if old_router_logits.numel() > 1e8:  # If tensor is very large (>100M elements)
+                    # Process in chunks to avoid OOM
+                    batch_size = old_router_logits.size(0)
+                    chunk_size = max(1, batch_size // 4)
+                    kl_chunks = []
+                    
+                    for i in range(0, batch_size, chunk_size):
+                        end_idx = min(i + chunk_size, batch_size)
+                        old_chunk = old_router_logits[i:end_idx]
+                        router_chunk = router_logits[i:end_idx]
+                        
+                        router_probs_chunk = F.log_softmax(router_chunk, dim=-1)
+                        old_router_probs_chunk = F.log_softmax(old_chunk, dim=-1)
+                        
+                        kl_chunk = kl_penalty(logprob=router_probs_chunk, ref_logprob=old_router_probs_chunk, kl_penalty="low_var_kl")
+                        if kl_chunk is not None:
+                            kl_chunks.append(kl_chunk.cpu())  # Move to CPU to save GPU memory
+                        
+                        # Clean up chunk tensors immediately
+                        del old_chunk, router_chunk, router_probs_chunk, old_router_probs_chunk, kl_chunk
+                    
+                    # Clean up original tensors
+                    del old_router_logits
+                    
+                    # Concatenate results back on GPU
+                    if kl_chunks:
+                        router_kl = torch.cat(kl_chunks, dim=0).to(router_logits.device)
+                        del kl_chunks
+                    else:
+                        router_kl = None
+                else:
+                    # Standard processing for smaller tensors
+                    router_probs = F.log_softmax(router_logits, dim=-1)
+                    old_router_probs = F.log_softmax(old_router_logits, dim=-1)
+                    
+                    # Clean up old_router_logits immediately after creating log_softmax
+                    del old_router_logits
+                    
+                    router_kl = kl_penalty(logprob=router_probs, ref_logprob=old_router_probs, kl_penalty="low_var_kl")
+                    
+                    # Clean up intermediate tensors
+                    del router_probs, old_router_probs
+                
                 if router_kl is not None:
                     router_kl_aggregated = router_kl.mean(dim=(2, 3))  # Average over layers and experts
+                    
+                    # Clean up router_kl after aggregation
+                    del router_kl
+                    
                     router_kl_loss = agg_loss(loss_mat=router_kl_aggregated, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
                     policy_loss = policy_loss + router_kl_loss * self.config.router_kl_loss_coef
                     metrics["actor/router_kl_loss"] = router_kl_loss.detach().item()
                     metrics["actor/router_kl_coef"] = self.config.router_kl_loss_coef
+                    
+                    # Clean up router_kl_aggregated after use
+                    del router_kl_aggregated
                 else:
                     if torch.distributed.get_rank() == 0:
                         print("Warning: router kl_penalty returned None, skipping router KL loss")
             else:
                 if torch.distributed.get_rank() == 0:
                     print("Warning: router_logits or old_router_logits is None, skipping router KL loss")
+        
+        # Aggressive final memory cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # Force synchronization to ensure memory is actually freed
+            torch.cuda.synchronize()
+            
+        # Clean up any remaining local variables that might hold tensor references
+        import gc
+        gc.collect()
+            
         return policy_loss, metrics
 
     def forward_backward_batch(
@@ -585,7 +688,7 @@ class MegatronPPOActor(BasePPOActor):
         - The model takes input: (input_ids, attention_mask, position_ids). No rmpad for the input
         - The communication shape is (total_nnz_pad_to_sp // tp_size, 1, hidden_size) if sequence parallel is enabled
         """
-        print_timing("Start forward prepare")
+        
         # data.to(get_device_id())
         # data.batch = data.batch.contiguous()
         mini_batch = data
@@ -636,10 +739,10 @@ class MegatronPPOActor(BasePPOActor):
         n_micro_batch = len(micro_batches)
 
         forward_backward_func = get_forward_backward_func()
-        print_timing("megatron_actor:Finished forward prepare")
+        
 
         def loss_func(output, data):
-            print_timing("Start loss_func")
+            
             # For memory efficiency
             # We move calculation of entropy to compute_log_probs, forward_only == True
             device = output["log_probs"].device
@@ -665,7 +768,7 @@ class MegatronPPOActor(BasePPOActor):
             policy_loss, metrics = self.compute_ppo_loss(model_output, data)
 
             # return loss and stats
-            print_timing("megatron_actor:Finished loss_func")
+            
             return policy_loss, metrics
 
         def forward_step(batch_iter, model):
@@ -736,7 +839,7 @@ class MegatronPPOActor(BasePPOActor):
                     return ret
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
-                print_timing("megatron_actor:Start megatron forward")
+                
                 output = forward_fn(
                     model,
                     input_ids,
@@ -748,7 +851,7 @@ class MegatronPPOActor(BasePPOActor):
                     logits_processor_args=logits_processor_args,
                     use_router_logits=self.use_router_logits,
                 )
-                print_timing("megatron_actor:Finished megatron forward")
+                
 
             return output, partial(loss_func, data=batch)
 
@@ -794,7 +897,27 @@ class MegatronPPOActor(BasePPOActor):
         metrics = {}
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.start()
+        
+        # Memory monitoring for GPU0 OOM debugging
+        initial_memory = get_torch_device().memory_allocated() / (1024**3)
+        if torch.distributed.get_rank() == 0:
+            logger.info(f"update_policy starting - GPU memory: {initial_memory:.2f}GB")
+        
+        minibatch_count = 0
         for data in dataloader:
+            minibatch_count += 1
+            
+            # Monitor memory before processing each minibatch (GPU0 OOM debugging)
+            if torch.distributed.get_rank() == 0:
+                current_memory = get_torch_device().memory_allocated() / (1024**3)
+                memory_growth = current_memory - initial_memory
+                logger.info(f"Minibatch {minibatch_count} - GPU memory: {current_memory:.2f}GB (growth: +{memory_growth:.2f}GB)")
+                
+                # Check for old_router_logits in the data
+                if "old_router_logits" in data.batch:
+                    router_size_mb = data.batch["old_router_logits"].numel() * data.batch["old_router_logits"].element_size() / (1024**2)
+                    logger.info(f"Minibatch {minibatch_count} contains router_logits: {router_size_mb:.1f}MB")
+            
             self.actor_optimizer.zero_grad()
             # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
             for chunk in self.actor_module:
@@ -832,9 +955,22 @@ class MegatronPPOActor(BasePPOActor):
                 raise NotImplementedError
             if self.use_torch_profiler and self.prof and self.prof.enable:
                 self.prof.step()
+                
+            # Aggressive memory cleanup after each minibatch to prevent memory accumulation
+            get_torch_device().empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()  # Ensure all operations complete before freeing memory
         # add empty cache after each compute
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.stop_and_save()
             self.prof.stop_trace()
         get_torch_device().empty_cache()
+        
+        # Final memory monitoring
+        final_memory = get_torch_device().memory_allocated() / (1024**3)
+        if torch.distributed.get_rank() == 0:
+            total_growth = final_memory - initial_memory
+            logger.info(f"update_policy completed - processed {minibatch_count} minibatches")
+            logger.info(f"Final GPU memory: {final_memory:.2f}GB (total growth: +{total_growth:.2f}GB)")
+        
         return metrics

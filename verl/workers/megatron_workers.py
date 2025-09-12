@@ -41,7 +41,6 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils import hf_tokenizer
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
-from verl.utils.timing_debug import print_timing, context_timer, timing_decorator
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import (
     get_device_id,
@@ -620,6 +619,58 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
+        
+        # Handle Ray object store references with optimized memory management
+        router_logits_ref_to_cleanup = None
+        old_router_logits_tensor = None
+        
+        if data.meta_info is not None and "old_router_logits_ref" in data.meta_info:
+            import ray
+            
+            router_logits_ref = data.meta_info["old_router_logits_ref"]
+            router_logits_ref_to_cleanup = router_logits_ref  # Keep reference for explicit cleanup
+            
+            # Get router logits but keep as separate variable initially
+            old_router_logits_tensor = ray.get(router_logits_ref)
+            
+            router_size_gb = data.meta_info.get("old_router_logits_size", 0.0)
+            router_shape = data.meta_info.get("old_router_logits_shape", "unknown")
+            
+            # Log memory status before processing large router logits
+            if torch.distributed.get_rank() == 0 and router_size_gb > 0.1:
+                current_allocated = get_torch_device().memory_allocated() / (1024**3)
+                logger.info(f"Processing router_logits {router_shape} ({router_size_gb:.2f}GB), current GPU memory: {current_allocated:.2f}GB")
+            
+            # Remove the reference from meta_info 
+            del data.meta_info["old_router_logits_ref"]
+            del router_logits_ref  # Remove local reference
+            
+            # Immediately clean up Ray object to free Ray object store memory
+            try:
+                ray.internal.free([router_logits_ref_to_cleanup])
+                if torch.distributed.get_rank() == 0:
+                    logger.info("Early cleanup of Ray object store for old_router_logits")
+            except Exception as e:
+                if torch.distributed.get_rank() == 0:
+                    logger.warning(f"Could not perform early Ray cleanup: {e}")
+        
+        # Only add router logits to data just before creating iterator to minimize memory duplication
+        if old_router_logits_tensor is not None:
+            # Check if router features are actually used to avoid unnecessary memory usage
+            need_router_logits = (
+                self.actor.config.get("use_router_shift", False) or 
+                self.actor.config.get("use_router_kl_loss", False)
+            )
+            
+            if need_router_logits:
+                data.batch["old_router_logits"] = old_router_logits_tensor
+            else:
+                # If router features not needed, skip adding to batch and free immediately
+                if torch.distributed.get_rank() == 0:
+                    logger.info("Router logits not needed for current config, skipping batch addition")
+                del old_router_logits_tensor
+                old_router_logits_tensor = None
+        
         dataloader = self.actor.make_minibatch_iterator(data=data)
         with Timer(name="update_policy", logger=None) as timer:
             metrics = self.actor.update_policy(dataloader=dataloader)
@@ -645,6 +696,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+
+        # Final cleanup of router logits tensor and remaining references
+        if old_router_logits_tensor is not None:
+            del old_router_logits_tensor
+            
+        if router_logits_ref_to_cleanup is not None:
+            # Ray object was already cleaned up earlier, just remove local reference
+            del router_logits_ref_to_cleanup
+            
+        # Force garbage collection to ensure all tensor references are cleared
+        import gc
+        gc.collect()
 
         aggressive_empty_cache(force_sync=True)
         return output
@@ -738,13 +801,35 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         
         # Filter out None values to avoid AttributeError in DataProto.from_dict
         tensors_dict = {"old_log_probs": output, "entropys": entropys}
+        
+        # Optimized router logits handling to avoid Ray serialization bottleneck
+        meta_info = {"temperature": self.config.rollout.temperature}
+        
         if router_logits is not None:
-            tensors_dict["old_router_logits"] = router_logits
+            # Check tensor size - if too large, use Ray object store instead of serialization
+            router_size_gb = router_logits.numel() * router_logits.element_size() / (1024**3)
+            
+            if router_size_gb > 0.05:  # If larger than 50MB, use object store
+                
+                # Put large tensor in Ray's object store to avoid serialization
+                # NOTE: router_logits is already on CPU from megatron_actor.compute_log_prob()
+                import ray
+                router_logits_ref = ray.put(router_logits)
+                
+                # Store reference in meta_info instead of tensors dict to avoid DataProto validation
+                meta_info["old_router_logits_ref"] = router_logits_ref
+                meta_info["old_router_logits_size"] = router_size_gb
+                meta_info["old_router_logits_shape"] = list(router_logits.shape)
+                
+            else:
+                # Small tensors can be serialized normally
+                tensors_dict["old_router_logits"] = router_logits
             
         output = DataProto.from_dict(
             tensors=tensors_dict,
-            meta_info={"temperature": self.config.rollout.temperature},
+            meta_info=meta_info,
         )
+        
         output = output.to("cpu")
         # clear kv cache
         if self._is_offload_param:

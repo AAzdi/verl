@@ -96,6 +96,17 @@ def preprocess_packed_seqs(
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
     )
+    # ------------------------------------------------------------------
+    # Cache CPU lists to avoid recomputing / extra GPU->CPU sync later.
+    # These are optional attributes (non-intrusive). Downstream code can
+    # fall back if they are absent.
+    # ------------------------------------------------------------------
+    try:
+        setattr(packed_seq_params, "_seqlens_in_batch_cpu", seqlens_in_batch_cpu)
+        setattr(packed_seq_params, "_cu_seqlens_padded_cpu", cu_seqlens_padded_cpu)
+    except Exception:
+        # In case PackedSeqParams uses slots or restricts attributes; safe no-op.
+        pass
     if pre_process:
         return input_ids_rmpad.unsqueeze(0), packed_seq_params
     else:
@@ -179,8 +190,15 @@ def postprocess_packed_seqs_router_safe(
     if not post_process:
         return output
 
-    cu_padded_cpu: list[int] = packed_seq_params.cu_seqlens_q_padded.tolist()
-    seq_lens_cpu: list[int] = attention_mask.sum(dim=1, dtype=torch.int32).cpu().tolist()
+    # Prefer cached CPU lists (avoids a second attention_mask.sum sync)
+    if hasattr(packed_seq_params, "_cu_seqlens_padded_cpu"):
+        cu_padded_cpu: list[int] = getattr(packed_seq_params, "_cu_seqlens_padded_cpu")
+    else:
+        cu_padded_cpu = packed_seq_params.cu_seqlens_q_padded.tolist()
+    if hasattr(packed_seq_params, "_seqlens_in_batch_cpu"):
+        seq_lens_cpu: list[int] = getattr(packed_seq_params, "_seqlens_in_batch_cpu")
+    else:
+        seq_lens_cpu = attention_mask.sum(dim=1, dtype=torch.int32).cpu().tolist()
 
     # Shape: [batch_size, seq_len, layers, expert_num]
     shape = [batch_size, seq_len] + list(output.shape[2:])
@@ -196,40 +214,44 @@ def postprocess_packed_seqs_router_safe(
     else:
         output_list = [output]
     
-    for i in range(batch_size):
-        if cp_size <= 1:
+    # Fast path: cp_size == 1 (most common) -> contiguous right-aligned slice because left padding
+    if cp_size <= 1:
+        packed_tensor = output[0]  # [packed_len, layers, expert_num]
+        packed_total = packed_tensor.shape[0]
+        for i in range(batch_size):
             s = seq_lens_cpu[i]
+            if s == 0:
+                continue
             start_idx = cu_padded_cpu[i]
-            
-            # Simple and direct assignment for router logits
-            available_tokens = min(s, output[0].shape[0] - start_idx)
-            if available_tokens > 0:
-                target_indices = torch.where(attention_mask[i])[0][:available_tokens]
-                output_new[i, target_indices] = output[0][start_idx : start_idx + available_tokens]
-            continue
-            
-        # Handle CP > 1 case with chunked processing
+            end_idx = start_idx + s
+            if end_idx > packed_total:
+                # Clamp in pathological cases
+                end_idx = packed_total
+                s = end_idx - start_idx
+                if s <= 0:
+                    continue
+            # Left padding means valid tokens occupy the last s positions
+            output_new[i, -s:] = packed_tensor[start_idx:end_idx]
+        return output_new
+
+    # Context parallel path
+    for i in range(batch_size):
         s_len_padded_chunk = (cu_padded_cpu[i + 1] - cu_padded_cpu[i]) // cp_size
         half_seqlen = s_len_padded_chunk // 2
         s_len = seq_lens_cpu[i]
+        if s_len == 0:
+            continue
         s_len_padded = s_len_padded_chunk * cp_size
         tmp = torch.empty(s_len_padded, *output.shape[2:], device=output.device)
-        
+        packed_start_idx = cu_padded_cpu[i] // cp_size
         for j in range(cp_size):
             o = output_list[j][0]
-            packed_start_idx = cu_padded_cpu[i] // cp_size
-            o0, o1 = (
-                o[packed_start_idx : packed_start_idx + half_seqlen],
-                o[packed_start_idx + half_seqlen : packed_start_idx + s_len_padded_chunk],
-            )
+            o0 = o[packed_start_idx : packed_start_idx + half_seqlen]
+            o1 = o[packed_start_idx + half_seqlen : packed_start_idx + s_len_padded_chunk]
             tmp[j * half_seqlen : (j + 1) * half_seqlen] = o0
             tmp[s_len_padded - (j + 1) * half_seqlen : s_len_padded - j * half_seqlen] = o1
-        
-        # Safe assignment for the final result
-        target_indices = torch.where(attention_mask[i])[0]
-        copy_len = min(s_len, len(target_indices), tmp.shape[0])
-        if copy_len > 0:
-            output_new[i, target_indices[:copy_len]] = tmp[:copy_len]
+        # Right-align valid tokens
+        output_new[i, -s_len:] = tmp[:s_len]
 
     return output_new
 
@@ -263,6 +285,111 @@ def postprocess_packed_router_logits(
         router_logits, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
     )
     return rl_padded
+
+
+def postprocess_packed_main_and_router(
+    main_outputs: dict[str, torch.Tensor] | torch.Tensor,
+    router_logits: torch.Tensor | None,
+    packed_seq_params: PackedSeqParams,
+    attention_mask: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    post_process: bool = True,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
+    """Unified unpack for main outputs (tensor or dict of packed tensors) and router logits.
+
+    Assumptions:
+      - Left padding.
+      - Packed tensors have leading dim 1 (shape [1, packed_len, ...]).
+      - Router logits shape [1, packed_len, L, E] (may already be padded if a padded capture mode is active upstream).
+
+    Fallback: if cp_size>1 or post_process=False, reuse existing individual functions.
+    """
+    if not post_process:
+        # Normalize main_outputs to dict
+        if isinstance(main_outputs, dict):
+            return main_outputs, router_logits
+        else:
+            return {"log_probs": main_outputs}, router_logits
+
+    # If router logits already padded (detected by second dim == seq_len and batch dim == batch_size), skip its unpack.
+    router_already_padded = (
+        router_logits is not None
+        and router_logits.ndim == 4
+        and router_logits.shape[0] == batch_size
+        and router_logits.shape[1] == seq_len
+    )
+
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size > 1 and not router_already_padded:
+        # Defer to existing slower path for correctness
+        # Main outputs
+        if isinstance(main_outputs, dict):
+            new_main = {
+                k: postprocess_packed_seqs(v, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True)
+                for k, v in main_outputs.items()
+            }
+        else:
+            new_main = {
+                "log_probs": postprocess_packed_seqs(
+                    main_outputs, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
+                )
+            }
+        new_router = postprocess_packed_router_logits(
+            router_logits, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
+        ) if router_logits is not None else None
+        return new_main, new_router
+
+    # Fast path (cp_size==1 or already padded router logits)
+    if isinstance(main_outputs, dict):
+        packed_items = list(main_outputs.items())
+    else:
+        packed_items = [("log_probs", main_outputs)]
+
+    # Prepare result dict with allocated padded tensors
+    if hasattr(packed_seq_params, "_cu_seqlens_padded_cpu"):
+        cu_padded_cpu: list[int] = getattr(packed_seq_params, "_cu_seqlens_padded_cpu")
+    else:
+        cu_padded_cpu = packed_seq_params.cu_seqlens_q_padded.tolist()
+    if hasattr(packed_seq_params, "_seqlens_in_batch_cpu"):
+        seq_lens_cpu: list[int] = getattr(packed_seq_params, "_seqlens_in_batch_cpu")
+    else:
+        seq_lens_cpu = attention_mask.sum(dim=1, dtype=torch.int32).cpu().tolist()
+
+    padded_main: dict[str, torch.Tensor] = {}
+    device = None
+    for name, tensor in packed_items:
+        if tensor is None:
+            continue
+        # Tensor shape expected: [1, packed_len, *suffix]
+        suffix = list(tensor.shape[2:])
+        out_shape = [batch_size, seq_len] + suffix
+        device = tensor.device
+        padded_main[name] = torch.zeros(out_shape, dtype=tensor.dtype, device=tensor.device)
+
+    if router_logits is not None and not router_already_padded:
+        rl_shape = [batch_size, seq_len] + list(router_logits.shape[2:])
+        padded_router = torch.zeros(rl_shape, dtype=router_logits.dtype, device=router_logits.device)
+    else:
+        padded_router = router_logits if router_already_padded else None
+
+    if not router_already_padded:
+        packed_router_tensor = router_logits[0] if router_logits is not None else None
+    # Perform single batch loop
+    for i in range(batch_size):
+        s = seq_lens_cpu[i]
+        if s == 0:
+            continue
+        start_idx = cu_padded_cpu[i]
+        end_idx = start_idx + s
+        for name, tensor in packed_items:
+            if tensor is None:
+                continue
+            padded_main[name][i, -s:] = tensor[0, start_idx:end_idx]
+        if padded_router is not None and packed_router_tensor is not None:
+            padded_router[i, -s:] = packed_router_tensor[start_idx:end_idx]
+
+    return padded_main, padded_router
 
 
 def remove_left_padding(
