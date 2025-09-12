@@ -913,6 +913,7 @@ def compute_policy_loss_gspo(
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
     router_shift_geometric_mean: torch.Tensor | None = None,
+    use_router_shift: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -938,7 +939,8 @@ def compute_policy_loss_gspo(
     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
 
     negative_approx_kl = log_prob - old_log_prob
-
+    if use_router_shift:
+        negative_approx_kl = negative_approx_kl * router_shift_geometric_mean
     # compute sequence-level importance ratio:
     # si(θ) = (π_θ(yi|x)/π_θold(yi|x))^(1/|yi|) =
     # exp [(1/|y_i|) * Σ_t log(π_θ(y_i,t|x,y_i,<t)/π_θold(y_i,t|x,y_i,<t))]

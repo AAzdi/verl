@@ -8,7 +8,7 @@ NNODES=${NNODES:-1}
 NGPUS_PER_NODES=${NGPUS_PER_NODES:-8}
 
 project_name='MoE-TTS-Qwen'
-exp_name='Qwen3-MoE-8k-deepscaler-grpo-router-shift-ratio-B200'
+exp_name='Qwen3-MoE-8k-deepscaler-gspo-router-shift-ratio-B200'
 
 adv_estimator=grpo
 
@@ -21,19 +21,19 @@ kl_loss_coef=0.0
 use_router_logits=True
 use_router_shift=True
 use_router_kl_loss=False
-router_kl_loss_coef=1.0
+router_kl_loss_coef=0.0
 
 
-clip_ratio_low=0.4
-clip_ratio_high=0.4
+clip_ratio_low=0.0003
+clip_ratio_high=0.0004
 max_prompt_length=$((1024 * 1))
 max_response_length=$((1024 * 8))
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 
-loss_mode=geo_mean
-loss_agg_mode="token-mean"
+loss_mode=gspo
+loss_agg_mode="seq-mean-token-mean"
 
 train_prompt_bsz=128
 n_resp_per_prompt=8
@@ -189,7 +189,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=False \
     trainer.test_freq=10 \
-    trainer.save_freq=100 \
+    trainer.save_freq=30 \
     trainer.default_local_dir=${DEFAULT_LOCAL_DIR} \
     trainer.total_epochs=10 \
     trainer.resume_mode=auto \
