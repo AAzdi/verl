@@ -472,30 +472,30 @@ class MegatronPPOActor(BasePPOActor):
                 router_shift = (selected_router_scores - old_topk_scores).abs() / (old_topk_scores + eps)
                 router_shift = 1 - router_shift
                 
+                router_shift = router_shift.mean(dim=-1)  # [B, S, L] , expert dim averaged
                 # Step 4: Memory-efficient aggregation using chunked processing if needed
                 if router_shift.numel() > 1e7:  # If tensor is large (>10M elements)
                     # Process in chunks to reduce peak memory
                     chunk_size = router_shift.size(0) // 4 + 1
-                    shift_means = []
+                    shift_prods = []
                     for i in range(0, router_shift.size(0), chunk_size):
                         chunk = router_shift[i:i+chunk_size]
-                        chunk_mean = chunk.mean(dim=-1)  # [chunk_bsz, max_resp_len]
-                        shift_means.append(chunk_mean)
-                    router_shift_mean = torch.cat(shift_means, dim=0)
+                        chunk_prod = chunk.prod(dim=-1)  # [chunk_bsz, max_resp_len]
+                        shift_prods.append(chunk_prod)
+                    router_shift_prod = torch.cat(shift_prods, dim=0)
                 else:
-                    router_shift_mean = router_shift.mean(dim=-1)  # [bsz, max_resp_len]
+                    router_shift_prod = router_shift.prod(dim=-1)  # [bsz, max_resp_len]
                 
-                # Step 5: Geometric mean calculation with log-space for numerical stability
-                log_shift = torch.log(torch.clamp(router_shift_mean, min=eps))
-                log_geom_mean = log_shift.mean(dim=-1)  # [bsz, max_resp_len]
-                router_shift_geometric_mean = torch.exp(log_geom_mean)  # [bsz, max_resp_len]
+                
+
+                router_shift_geometric_mean = router_shift_prod ** (1/router_shift.size(-1))  # [bsz, max_resp_len]
                 
                 # Clean up intermediate tensors
                 del old_topk_logits, old_topk_scores, selected_router_logits, selected_router_scores
-                del router_shift, log_shift, log_geom_mean
+                del router_shift, router_shift_prod
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 
-            # Use response_mask directly since router_shift_geometric_mean now has shape [bsz, max_resp_len]
+            # Use response_mask directly since router_shift_cumulative_prod now has shape [bsz, max_resp_len]
             router_shift_ratio = agg_loss(loss_mat=router_shift_geometric_mean, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
             metrics["actor/router_shift_ratio"] = router_shift_ratio.detach().item()
             

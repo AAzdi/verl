@@ -939,8 +939,6 @@ def compute_policy_loss_gspo(
     clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
 
     negative_approx_kl = log_prob - old_log_prob
-    if use_router_shift:
-        negative_approx_kl = negative_approx_kl * router_shift_geometric_mean
     # compute sequence-level importance ratio:
     # si(θ) = (π_θ(yi|x)/π_θold(yi|x))^(1/|yi|) =
     # exp [(1/|y_i|) * Σ_t log(π_θ(y_i,t|x,y_i,<t)/π_θold(y_i,t|x,y_i,<t))]
@@ -954,7 +952,10 @@ def compute_policy_loss_gspo(
     log_seq_importance_ratio = torch.clamp(log_seq_importance_ratio, max=10.0)  # clamp for numerical stability
 
     # finaly exp() to remove log
-    seq_importance_ratio = torch.exp(log_seq_importance_ratio)
+    if use_router_shift:
+        seq_importance_ratio = torch.exp(log_seq_importance_ratio) * router_shift_geometric_mean
+    else:
+        seq_importance_ratio = torch.exp(log_seq_importance_ratio)
 
     pg_losses1 = -advantages * seq_importance_ratio
     pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
