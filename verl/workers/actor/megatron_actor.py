@@ -46,7 +46,6 @@ from verl.utils.profiler.profile import Profiler
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
-from verl.utils.timing_debug import print_timing, context_timer, timing_decorator
 from verl.workers.actor import BasePPOActor
 
 __all__ = ["MegatronPPOActor"]
@@ -184,7 +183,6 @@ class MegatronPPOActor(BasePPOActor):
         Returns:
             DataProto: torch.Tensor: the log_prob tensor
         """
-        print_timing("megatron_actor:Starting compute_log_prob")
         use_dynamic_bsz = data.meta_info.get("use_dynamic_bsz", False)
         micro_batch_size = data.meta_info.get("micro_batch_size", None)
         max_token_len = data.meta_info.get("max_token_len", None)
@@ -208,7 +206,6 @@ class MegatronPPOActor(BasePPOActor):
         response = batch["responses"]
         response_length = response.size(1)
         with torch.no_grad():
-            print_timing("Starting forward_backward_batch")
             output = self.forward_backward_batch(
                 data,
                 forward_only=True,
@@ -217,7 +214,6 @@ class MegatronPPOActor(BasePPOActor):
                 micro_batch_size=micro_batch_size,
                 max_token_len=max_token_len,
             )
-            print_timing("Finished forward_backward_batch")
 
             # -------------------------
             # Collect log_probs / entropy (last PP stage only)
@@ -385,7 +381,6 @@ class MegatronPPOActor(BasePPOActor):
 
         # add empty cache after each compute
         get_torch_device().empty_cache()
-        print_timing("megatron_actor:Finished compute_log_prob")
 
         return log_probs, entropys, aggregated_router_logits
 
@@ -503,6 +498,16 @@ class MegatronPPOActor(BasePPOActor):
             # Use response_mask directly since router_shift_geometric_mean now has shape [bsz, max_resp_len]
             router_shift_ratio = agg_loss(loss_mat=router_shift_geometric_mean, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
             metrics["actor/router_shift_ratio"] = router_shift_ratio.detach().item()
+            
+            # Calculate min and max router shift values for additional statistics
+            with torch.no_grad():
+                # Apply response mask to get valid router shift values
+                masked_router_shift = router_shift_geometric_mean[response_mask]
+                if masked_router_shift.numel() > 0:
+                    router_shift_min = masked_router_shift.min().item()
+                    router_shift_max = masked_router_shift.max().item()
+                    metrics["actor/router_shift_min"] = router_shift_min
+                    metrics["actor/router_shift_max"] = router_shift_max
 
         policy_loss_fn = get_policy_loss_fn(loss_mode)
         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
@@ -585,7 +590,6 @@ class MegatronPPOActor(BasePPOActor):
         - The model takes input: (input_ids, attention_mask, position_ids). No rmpad for the input
         - The communication shape is (total_nnz_pad_to_sp // tp_size, 1, hidden_size) if sequence parallel is enabled
         """
-        print_timing("Start forward prepare")
         # data.to(get_device_id())
         # data.batch = data.batch.contiguous()
         mini_batch = data
@@ -636,10 +640,8 @@ class MegatronPPOActor(BasePPOActor):
         n_micro_batch = len(micro_batches)
 
         forward_backward_func = get_forward_backward_func()
-        print_timing("megatron_actor:Finished forward prepare")
 
         def loss_func(output, data):
-            print_timing("Start loss_func")
             # For memory efficiency
             # We move calculation of entropy to compute_log_probs, forward_only == True
             device = output["log_probs"].device
@@ -665,7 +667,6 @@ class MegatronPPOActor(BasePPOActor):
             policy_loss, metrics = self.compute_ppo_loss(model_output, data)
 
             # return loss and stats
-            print_timing("megatron_actor:Finished loss_func")
             return policy_loss, metrics
 
         def forward_step(batch_iter, model):
@@ -736,7 +737,6 @@ class MegatronPPOActor(BasePPOActor):
                     return ret
 
                 logits_processor_args = {"label": label, "label_mask": label_mask}
-                print_timing("megatron_actor:Start megatron forward")
                 output = forward_fn(
                     model,
                     input_ids,
@@ -748,7 +748,6 @@ class MegatronPPOActor(BasePPOActor):
                     logits_processor_args=logits_processor_args,
                     use_router_logits=self.use_router_logits,
                 )
-                print_timing("megatron_actor:Finished megatron forward")
 
             return output, partial(loss_func, data=batch)
 

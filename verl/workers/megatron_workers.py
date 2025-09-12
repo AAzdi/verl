@@ -618,6 +618,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             load_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After load actor optimizer during update_actor", logger=logger)
 
+        # Get router_logits from Ray object store if available
+        router_logits_ref = data.meta_info.get("router_logits_ref", None)
+        if router_logits_ref is not None:
+            import ray
+            # Get router_logits from Ray object store and add to batch
+            old_router_logits = ray.get(router_logits_ref)
+            data.batch["old_router_logits"] = old_router_logits
+
         micro_batch_size = self.config.actor.ppo_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         dataloader = self.actor.make_minibatch_iterator(data=data)
@@ -646,6 +654,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             offload_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        # Clean up Ray object reference
+        router_logits_ref = data.meta_info.get("router_logits_ref", None)
+        if router_logits_ref is not None:
+            import ray
+            # Delete ray object to free memory  
+            del router_logits_ref
+            
         aggressive_empty_cache(force_sync=True)
         return output
 
@@ -738,12 +753,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         
         # Filter out None values to avoid AttributeError in DataProto.from_dict
         tensors_dict = {"old_log_probs": output, "entropys": entropys}
+        
+        # Use ray.put for router_logits to avoid serialization overhead
+        router_logits_ref = None
         if router_logits is not None:
-            tensors_dict["old_router_logits"] = router_logits
+            import ray
+            # Put router_logits into Ray object store to avoid serialization
+            router_logits_ref = ray.put(router_logits)
             
         output = DataProto.from_dict(
             tensors=tensors_dict,
-            meta_info={"temperature": self.config.rollout.temperature},
+            meta_info={
+                "temperature": self.config.rollout.temperature,
+                "router_logits_ref": router_logits_ref  # Store ray object reference
+            },
         )
         output = output.to("cpu")
         # clear kv cache

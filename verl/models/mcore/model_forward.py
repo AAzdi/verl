@@ -15,7 +15,6 @@
 # limitations under the License.
 
 from verl.utils.megatron_utils import unwrap_model
-from verl.utils.timing_debug import print_timing, context_timer, timing_decorator
 
 from .util import (
     postprocess_packed_seqs,
@@ -47,7 +46,6 @@ def gptmodel_forward(
         batch_size, seq_len = attention_mask.shape[:2]
         input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=pre_process)
         input_ids_rmpad = input_ids_rmpad.contiguous()
-        print_timing("model_forward:Start megatron model forward")
         model_output = model(
             input_ids=input_ids_rmpad,
             attention_mask=None,
@@ -55,7 +53,6 @@ def gptmodel_forward(
             packed_seq_params=packed_seq_params,
             use_router_logits=use_router_logits,
         )
-        print_timing("model_forward:Finished megatron model forward")
 
         # Parse model output consistently across all pipeline stages
         if use_router_logits and isinstance(model_output, tuple) and len(model_output) == 2:
@@ -84,11 +81,9 @@ def gptmodel_forward(
 
         # Router logits postprocess (packed -> padded) - only if enabled
         if use_router_logits:
-            print_timing("model_forward:Start postprocess router logits")
             router_logits = postprocess_packed_router_logits(
                 router_logits_raw, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
             )
-            print_timing("model_forward:Finished postprocess router logits") 
         else:
             router_logits = None
     else:
