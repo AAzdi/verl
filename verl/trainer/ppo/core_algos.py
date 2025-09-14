@@ -913,6 +913,7 @@ def compute_policy_loss_gspo(
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
     router_shift_geometric_mean: torch.Tensor | None = None,
+    use_router_shift: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -954,9 +955,15 @@ def compute_policy_loss_gspo(
     # finaly exp() to remove log
     seq_importance_ratio = torch.exp(log_seq_importance_ratio)
 
+    
+
     pg_losses1 = -advantages * seq_importance_ratio
     pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    # apply router shift after clip
+    if use_router_shift and router_shift_geometric_mean is not None:
+        pg_losses = pg_losses * router_shift_geometric_mean
 
     # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
@@ -1213,8 +1220,7 @@ def compute_policy_loss_geo_mean(
         cliprange_high = cliprange
 
     negative_approx_kl = log_prob - old_log_prob
-    if use_router_shift:
-        negative_approx_kl = negative_approx_kl * router_shift_geometric_mean
+
     # Clamp negative_approx_kl for stability (uncomment it if you like)
     # negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
@@ -1224,6 +1230,10 @@ def compute_policy_loss_geo_mean(
     negative_approx_kl_clamp = torch.clamp(negative_approx_kl, -cliprange_low, cliprange_high)
     negative_approx_kl_min = torch.min(sgn_advantage * negative_approx_kl, sgn_advantage * negative_approx_kl_clamp)
     negative_approx_kl_min = sgn_advantage * negative_approx_kl_min
+
+    # apply router shift after clip
+    if use_router_shift and router_shift_geometric_mean is not None:
+        negative_approx_kl_min = negative_approx_kl_min * router_shift_geometric_mean
 
     # Geometric-Mean Policy Optimization
     response_mask_sum = response_mask.sum(dim=-1)

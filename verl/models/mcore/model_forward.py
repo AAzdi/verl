@@ -112,10 +112,10 @@ def gptmodel_forward(
         else:
             output = {"log_probs": output}
     
-    if use_router_logits:
-        print(
-            f"log_probs shape: {output['log_probs'].shape if 'log_probs' in output else None}, Router logits shape: {output['router_logits'].shape if 'router_logits' in output else None}"
-        )
+    # if use_router_logits:
+    #     print(
+    #         f"log_probs shape: {output['log_probs'].shape if 'log_probs' in output else None}, Router logits shape: {output['router_logits'].shape if 'router_logits' in output else None}"
+    #     )
     return output
 
 
