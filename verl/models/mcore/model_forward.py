@@ -64,15 +64,29 @@ def gptmodel_forward(
 
         # Unified unpack for main + router logits
         if post_process and logits_processor is not None:
-            args = {k: preprocess_packed_seqs(v, attention_mask, pre_process=True)[0] for k, v in logits_processor_args.items()}
+            args = {
+                k: preprocess_packed_seqs(v, attention_mask, pre_process=True)[0]
+                for k, v in logits_processor_args.items()
+            }
             output_dict = logits_processor(output_orig, **args)
-            output, router_logits = postprocess_packed_main_and_router(
-                output_dict, router_logits_raw, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+            output = {
+                k: postprocess_packed_seqs(
+                    v, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+                )
+                for k, v in output_dict.items()
+            }
+        else:
+            output = postprocess_packed_seqs(
+                output_orig, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
+            )
+
+        # Router logits postprocess (packed -> padded) - only if enabled
+        if use_router_logits:
+            router_logits = postprocess_packed_router_logits(
+                router_logits_raw, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
             )
         else:
-            output, router_logits = postprocess_packed_main_and_router(
-                output_orig, router_logits_raw, packed_seq_params, attention_mask, batch_size, seq_len, post_process=post_process
-            )
+            router_logits = None
     else:
         assert logits_processor is None, "logits_processor is not supported for non-packed sequence"
         batch_size, sequence_length = attention_mask.shape

@@ -373,8 +373,11 @@ def postprocess_packed_main_and_router(
     else:
         padded_router = router_logits if router_already_padded else None
 
+    # Define packed_router_tensor regardless of router_already_padded status
     if not router_already_padded:
         packed_router_tensor = router_logits[0] if router_logits is not None else None
+    else:
+        packed_router_tensor = None  # Not needed when router is already padded
     # Perform single batch loop
     for i in range(batch_size):
         s = seq_lens_cpu[i]

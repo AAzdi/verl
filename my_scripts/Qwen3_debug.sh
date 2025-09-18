@@ -8,7 +8,7 @@ NNODES=${NNODES:-1}
 NGPUS_PER_NODES=${NGPUS_PER_NODES:-8}
 
 project_name='MoE-TTS-Qwen'
-exp_name='Qwen3-MoE-8k-deepscaler-gspo-clip-3e-4-4e-4-router-shift-ratio-after-clip-B200'
+exp_name='Qwen3-MoE-8k-deepscaler-gspo-clip-3e-4-4e-4-router-shift-ratio-after-clip-0.9-B200'
 
 adv_estimator=grpo
 
@@ -22,7 +22,7 @@ use_router_logits=True
 use_router_shift=True
 use_router_kl_loss=False
 router_kl_loss_coef=1.0
-
+router_shift_clip_threshold=0.9
 
 clip_ratio_low=0.0003
 clip_ratio_high=0.0004
@@ -123,6 +123,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
     +actor_rollout_ref.actor.use_router_kl_loss=${use_router_kl_loss} \
     +actor_rollout_ref.actor.router_kl_loss_coef=${router_kl_loss_coef} \
     +actor_rollout_ref.actor.use_router_shift=${use_router_shift} \
+    +actor_rollout_ref.actor.router_shift_clip_threshold=${router_shift_clip_threshold} \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
@@ -189,7 +190,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=False \
     trainer.test_freq=10 \
-    trainer.save_freq=100 \
+    trainer.save_freq=30 \
     trainer.default_local_dir=${DEFAULT_LOCAL_DIR} \
     trainer.total_epochs=10 \
     trainer.resume_mode=auto \

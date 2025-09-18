@@ -955,6 +955,8 @@ def compute_policy_loss_gspo(
     # finaly exp() to remove log
     seq_importance_ratio = torch.exp(log_seq_importance_ratio)
 
+
+
     
 
     pg_losses1 = -advantages * seq_importance_ratio
@@ -963,7 +965,7 @@ def compute_policy_loss_gspo(
 
     # apply router shift after clip
     if use_router_shift and router_shift_geometric_mean is not None:
-        pg_losses = pg_losses * router_shift_geometric_mean
+        seq_importance_ratio = seq_importance_ratio * router_shift_geometric_mean
 
     # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")

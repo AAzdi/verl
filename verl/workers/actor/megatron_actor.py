@@ -147,6 +147,8 @@ class MegatronPPOActor(BasePPOActor):
             print(f"Router logits collection enabled: {self.use_router_logits}")
             print(f"Router KL loss enabled: {self.use_router_kl_loss}")
             print(f"Router shift enabled: {self.use_router_shift}")
+            if self.use_router_shift:
+                print(f"Router shift clip threshold: {self.config.get('router_shift_clip_threshold', 0.0)}")
             if self.use_router_kl_loss and not self.use_router_logits:
                 print("WARNING: Router KL loss is enabled but router logits collection is disabled!")
                 print("Please set use_router_logits=True to enable router KL loss.")
@@ -524,18 +526,29 @@ class MegatronPPOActor(BasePPOActor):
                 log_geom_mean = log_shift.mean(dim=-1)  # [bsz, max_resp_len]
                 router_shift_geometric_mean = torch.exp(log_geom_mean)  # [bsz, max_resp_len]
 
-                
+                # Apply clipping to router_shift_geometric_mean: clip values < 0.7 to 0 (in-place)
+                clip_threshold = self.config.get("router_shift_clip_threshold", 0.7)
+                clip_mask = router_shift_geometric_mean < clip_threshold
+                router_shift_geometric_mean.masked_fill_(clip_mask, 0.0)
+                del clip_mask
                 
         # Calculate router shift ratio only if we actually computed it
         if router_shift_geometric_mean is not None:
+            # Compute clip fraction after in-place clip: count zeros introduced by clipping
+            import verl.utils.torch_functional as verl_F
+            router_shift_clipfrac = verl_F.masked_mean(
+                (router_shift_geometric_mean == 0).float(),
+                response_mask
+            )
+            metrics["actor/router_shift_clipfrac"] = router_shift_clipfrac.detach().item()
+            
+            
             # Compute mean router shift ratio using aggregation function
             router_shift_ratio = agg_loss(loss_mat=router_shift_geometric_mean, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
             metrics["actor/router_shift_ratio"] = router_shift_ratio.detach().item()
             
-            # Compute additional statistics: max and min values
-            # Apply response mask to get valid values only
-            masked_values = router_shift_geometric_mean * response_mask.float()
-            valid_values = masked_values[response_mask]  # Extract only valid (non-masked) values
+            # Compute additional statistics: max and min values on valid tokens only
+            valid_values = router_shift_geometric_mean[response_mask]
             
             if valid_values.numel() > 0:  # Ensure we have valid values
                 router_shift_max = valid_values.max().detach().item()
@@ -543,6 +556,8 @@ class MegatronPPOActor(BasePPOActor):
                 
                 metrics["actor/router_shift_ratio_max"] = router_shift_max
                 metrics["actor/router_shift_ratio_min"] = router_shift_min
+            
+            # No extra temporaries to clean here
 
         policy_loss_fn = get_policy_loss_fn(loss_mode)
         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
