@@ -560,7 +560,7 @@ class MegatronPPOActor(BasePPOActor):
             # No extra temporaries to clean here
 
         policy_loss_fn = get_policy_loss_fn(loss_mode)
-        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, overlap_frac = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
             advantages=advantages,
@@ -581,6 +581,7 @@ class MegatronPPOActor(BasePPOActor):
                 "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                 "actor/ppo_kl": ppo_kl.detach().item(),
                 "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                "actor/overlap_frac": overlap_frac.detach().item(),
             }
         )
         policy_loss = pg_loss

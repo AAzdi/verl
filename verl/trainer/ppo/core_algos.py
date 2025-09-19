@@ -810,7 +810,7 @@ def compute_policy_loss(
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, torch.tensor(0.0)
 
 
 @register_policy_loss("vanilla")
@@ -955,17 +955,16 @@ def compute_policy_loss_gspo(
     # finaly exp() to remove log
     seq_importance_ratio = torch.exp(log_seq_importance_ratio)
 
-
-
-    
-
     pg_losses1 = -advantages * seq_importance_ratio
     pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
 
-    # apply router shift after clip
+    # Track router shift clipping before applying it
+    router_clip_mask = None
     if use_router_shift and router_shift_geometric_mean is not None:
-        seq_importance_ratio = seq_importance_ratio * router_shift_geometric_mean
+        # Track which tokens were clipped to 0 in router shift (assuming original values > 0)
+        router_clip_mask = (router_shift_geometric_mean == 0.0) & (response_mask > 0)
+        pg_losses = pg_losses * router_shift_geometric_mean
 
     # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
@@ -973,10 +972,29 @@ def compute_policy_loss_gspo(
     # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
     pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+    
+    # Log overlap between router clip and PG clip
+    if router_clip_mask is not None:
+        # Router clip fraction
+        router_clipfrac = verl_F.masked_mean(router_clip_mask.float(), response_mask)
+        
+        # PG clip mask
+        pg_clip_mask = torch.gt(pg_losses2, pg_losses1) & (response_mask > 0)
+        
+        # Overlap: tokens that are both router-clipped and pg-clipped
+        overlap_mask = router_clip_mask & pg_clip_mask
+        overlap_frac = verl_F.masked_mean(overlap_mask.float(), response_mask)
+        
+        # # Log statistics (you can adjust logging method as needed)
+        # import logging
+        # logger = logging.getLogger(__name__)
+        # logger.info(f"GSPO - Router clip frac: {router_clipfrac:.4f}, PG clip frac: {verl_F.masked_mean(pg_clip_mask.float(), response_mask):.4f}, Overlap frac: {overlap_frac:.4f}")
+    else:
+        overlap_frac = torch.tensor(0.0)
 
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, overlap_frac
 
 
 @register_policy_loss("gpg")
@@ -1005,7 +1023,7 @@ def compute_policy_loss_gpg(
     pg_losses = -log_prob * advantages
 
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-    return pg_loss, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
+    return pg_loss, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
 
 
 @register_policy_loss("clip_cov")
@@ -1100,7 +1118,7 @@ def compute_policy_loss_clip_cov(
     pg_losses = torch.maximum(pg_losses1, pg_losses2) * corr
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-    return pg_loss, pg_clipfrac, ppo_kl, torch.tensor(0.0)
+    return pg_loss, pg_clipfrac, ppo_kl, torch.tensor(0.0), torch.tensor(0.0)
 
 
 @register_policy_loss("kl_cov")
@@ -1173,7 +1191,7 @@ def compute_policy_loss_kl_cov(
 
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-    return pg_loss, torch.tensor(0.0), ppo_kl_abs, torch.tensor(0.0)
+    return pg_loss, torch.tensor(0.0), ppo_kl_abs, torch.tensor(0.0), torch.tensor(0.0)
 
 
 @register_policy_loss("geo_mean")
@@ -1203,6 +1221,8 @@ def compute_policy_loss_geo_mean(
             Advantage estimates for each action, shape (batch_size, response_length).
         response_mask (torch.Tensor):
             Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        router_shift_geometric_mean (torch.Tensor, optional):
+            Router shift values applied at token level, shape (batch_size, response_length).
         loss_agg_mode (str, optional):
             not used
     """
@@ -1233,13 +1253,18 @@ def compute_policy_loss_geo_mean(
     negative_approx_kl_min = torch.min(sgn_advantage * negative_approx_kl, sgn_advantage * negative_approx_kl_clamp)
     negative_approx_kl_min = sgn_advantage * negative_approx_kl_min
 
-    # apply router shift after clip
+    # Apply router shift in log space (add log of router shift to negative_approx_kl_min)
+    router_clip_mask = None
     if use_router_shift and router_shift_geometric_mean is not None:
-        negative_approx_kl_min = negative_approx_kl_min * router_shift_geometric_mean
+        # Track which tokens were clipped to 0 in router shift (assuming original values > 0)
+        router_clip_mask = (router_shift_geometric_mean == 0.0) & (response_mask > 0)
+        log_router_shift = torch.log(torch.clamp(router_shift_geometric_mean, min=1e-8))
+        negative_approx_kl_min = negative_approx_kl_min + log_router_shift
 
     # Geometric-Mean Policy Optimization
     response_mask_sum = response_mask.sum(dim=-1)
     ratio = torch.exp((negative_approx_kl_min * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8))
+
     # we only support sequence level advantage for now,
     # otherwise, below would be not consistent with the paper
     advantage = (advantages * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
@@ -1250,8 +1275,27 @@ def compute_policy_loss_geo_mean(
     clipped = torch.ne(negative_approx_kl, negative_approx_kl_clamp)
     pg_clipfrac = verl_F.masked_mean((clipped * (advantages > 0)).float(), response_mask)
     pg_clipfrac_lower = verl_F.masked_mean((clipped * (advantages < 0)).float(), response_mask)
+    
+    # Log overlap between router clip and PG clip
+    if router_clip_mask is not None:
+        # Router clip fraction
+        router_clipfrac = verl_F.masked_mean(router_clip_mask.float(), response_mask)
+        
+        # PG clip mask (both positive and negative advantages)
+        pg_clip_mask = clipped & (response_mask > 0)
+        
+        # Overlap: tokens that are both router-clipped and pg-clipped
+        overlap_mask = router_clip_mask & pg_clip_mask
+        overlap_frac = verl_F.masked_mean(overlap_mask.float(), response_mask)
+        
+        # # Log statistics (you can adjust logging method as needed)
+        # import logging
+        # logger = logging.getLogger(__name__)
+        # logger.info(f"GMPO - Router clip frac: {router_clipfrac:.4f}, PG clip frac: {verl_F.masked_mean(pg_clip_mask.float(), response_mask):.4f}, Overlap frac: {overlap_frac:.4f}")
+    else:
+        overlap_frac = torch.tensor(0.0)
 
-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, overlap_frac
 
 
 def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean"):
