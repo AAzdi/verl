@@ -823,6 +823,7 @@ def compute_policy_loss_vanilla(
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
     router_shift_geometric_mean: torch.Tensor | None = None,
+    **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1204,6 +1205,7 @@ def compute_policy_loss_geo_mean(
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
     router_shift_geometric_mean: torch.Tensor | None = None,
+    router_clip_mask: torch.Tensor | None = None,
     use_router_shift: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -1253,20 +1255,29 @@ def compute_policy_loss_geo_mean(
     negative_approx_kl_min = torch.min(sgn_advantage * negative_approx_kl, sgn_advantage * negative_approx_kl_clamp)
     negative_approx_kl_min = sgn_advantage * negative_approx_kl_min
 
-    # Apply router shift in log space (add log of router shift to negative_approx_kl_min)
-    router_clip_mask = None
+    # Router shift token-level clip: PPO-style neutral preservation
     if use_router_shift and router_shift_geometric_mean is not None:
-        # Track which tokens were clipped to 0 in router shift (assuming original values > 0)
-        router_clip_mask = (router_shift_geometric_mean == 0.0) & (response_mask > 0)
-        log_router_shift = torch.log(torch.clamp(router_shift_geometric_mean, min=1e-8))
-        negative_approx_kl_min = negative_approx_kl_min + log_router_shift
-
-    # Geometric-Mean Policy Optimization
+        # Get the threshold from config (default 0.7 if not specified)
+        clip_threshold = config.get("router_shift_clip_threshold", 0.7)
+        
+        # Use the precomputed router_clip_mask from megatron_actor if available, 
+        # otherwise create it here (fallback for compatibility)
+        if router_clip_mask is None:
+            router_clip_mask = (router_shift_geometric_mean < clip_threshold) & (response_mask > 0)
+        
+        # Apply router weights directly to negative_approx_kl_min (router_shift_geometric_mean is already processed)
+        # Convert to log space for addition to log probabilities
+        log_router_weights = torch.log(torch.clamp(router_shift_geometric_mean, min=1e-8))
+        negative_approx_kl_min = negative_approx_kl_min + log_router_weights
+        
+        # Apply PPO-style gradient clipping at token level using your formula
+        negative_approx_kl_min = negative_approx_kl_min * (~router_clip_mask) + (negative_approx_kl_min * router_clip_mask).detach()
+    
+    # Geometric-Mean Policy Optimization (standard GMPO with router-weighted tokens)
     response_mask_sum = response_mask.sum(dim=-1)
     ratio = torch.exp((negative_approx_kl_min * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8))
 
-    # we only support sequence level advantage for now,
-    # otherwise, below would be not consistent with the paper
+    # we only support sequence level advantage for now (keep original mask for advantage)
     advantage = (advantages * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
     pg_losses = -advantage * ratio
     pg_loss = torch.mean(pg_losses)

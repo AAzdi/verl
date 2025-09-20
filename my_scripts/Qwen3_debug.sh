@@ -8,7 +8,7 @@ NNODES=${NNODES:-1}
 NGPUS_PER_NODES=${NGPUS_PER_NODES:-8}
 
 project_name='MoE-TTS-Qwen'
-exp_name='Qwen3-MoE-8k-deepscaler-gspo-clip-3e-4-4e-4-router-shift-ratio-after-clip-0.9-B200'
+exp_name='Qwen3-MoE-8k-deepscaler-gmpo-clip-0.4-0.4-router-shift-ratio-after-clip-0.9-gmean-B200'
 
 adv_estimator=grpo
 
@@ -23,17 +23,18 @@ use_router_shift=True
 use_router_kl_loss=False
 router_kl_loss_coef=1.0
 router_shift_clip_threshold=0.9
+router_shift_ratio_geo_mean=True
 
-clip_ratio_low=0.0003
-clip_ratio_high=0.0004
+clip_ratio_low=0.4
+clip_ratio_high=0.4
 max_prompt_length=$((1024 * 1))
 max_response_length=$((1024 * 8))
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 
-loss_mode=gspo
-loss_agg_mode="seq-mean-token-mean"
+loss_mode=geo_mean
+loss_agg_mode="token-mean"
 
 train_prompt_bsz=128
 n_resp_per_prompt=8
@@ -119,6 +120,7 @@ python3 -m verl.trainer.main_ppo --config-path=./config --config-name='ppo_megat
     actor_rollout_ref.actor.policy_loss.loss_mode=${loss_mode} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
+    +actor_rollout_ref.actor.router_shift_ratio_geo_mean=${router_shift_ratio_geo_mean} \
     +actor_rollout_ref.actor.use_router_logits=${use_router_logits} \
     +actor_rollout_ref.actor.use_router_kl_loss=${use_router_kl_loss} \
     +actor_rollout_ref.actor.router_kl_loss_coef=${router_kl_loss_coef} \

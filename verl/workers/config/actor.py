@@ -110,6 +110,7 @@ class ActorConfig(BaseConfig):
     use_router_kl_loss: bool = False
     router_kl_loss_coef: float = 1.0
     router_shift_clip_threshold: float = 0.7
+    router_shift_ratio_geo_mean: bool = False # if True, use geometric mean; if False, use product
     use_router_logits: bool = False
     use_kl_loss: bool = False
     use_torch_compile: bool = True

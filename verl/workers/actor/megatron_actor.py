@@ -493,55 +493,70 @@ class MegatronPPOActor(BasePPOActor):
 
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-        # add router ratio - memory optimized version with aggressive cleanup
+        # add router ratio - memory optimized version with improved numerical stability
         router_shift_geometric_mean = None
+        router_clip_mask = None
         if self.config.get("use_router_shift", False) and old_router_logits is not None and router_logits is not None:
             # Memory optimization: avoid creating full softmax matrices and use streaming computation
             with torch.no_grad():  # Router shift calculation doesn't need gradients
                 eps = 1e-8
                 
-                # Step 1: Get top-k from old router logits efficiently (reduce k if memory is tight)
+                # Step 1: First compute full softmax for both old and current router logits
+                # This ensures we're working with proper probability distributions
+                old_router_probs = F.softmax(old_router_logits, dim=-1)
+                current_router_probs = F.softmax(router_logits, dim=-1)
+                
+                # Step 2: Get top-k experts from old router probabilities for efficient computation
                 k_experts = min(8, old_router_logits.size(-1))  # Adaptive k based on available experts
-                old_topk_logits, topk_indices = torch.topk(old_router_logits, k_experts, dim=-1)
-                old_topk_scores = F.softmax(old_topk_logits, dim=-1)
-                          
-                # Step 2: Extract corresponding logits from current router and compute softmax
-                selected_router_logits = torch.gather(router_logits, dim=-1, index=topk_indices)
-                selected_router_scores = F.softmax(selected_router_logits, dim=-1)
+                old_topk_probs, topk_indices = torch.topk(old_router_probs, k_experts, dim=-1)
+                
+                # Step 3: Extract corresponding probabilities from current router
+                selected_current_probs = torch.gather(current_router_probs, dim=-1, index=topk_indices)
+                
+                # Clean up full probability matrices to save memory
+                del old_router_probs, current_router_probs
+                
+                # Step 4: Compute shift using exp(-|Δlog p|) for numerical stability
+                # Convert probabilities to log space for stable computation
+                old_log_probs = torch.log(torch.clamp(old_topk_probs, min=eps))
+                current_log_probs = torch.log(torch.clamp(selected_current_probs, min=eps))
+     
+                # Calculate |Δlog p| = |log(p_new) - log(p_old)|
+                delta_log_probs = torch.abs(current_log_probs - old_log_probs)
+                
+                # Compute router shift as exp(-|Δlog p|) for each expert
+                router_shift = torch.exp(-delta_log_probs)
                 
                 # Clean up intermediate tensors
-                del selected_router_logits, topk_indices
+                del old_topk_probs, selected_current_probs, old_log_probs, current_log_probs, delta_log_probs
                 
-                # Step 3: Compute shift with numerical stability
-                router_shift = (selected_router_scores - old_topk_scores).abs() / (old_topk_scores + eps)
-                router_shift = 1 - router_shift
+                # Step 5: Streaming aggregation to minimize peak memory usage
+                router_shift_mean = router_shift.mean(dim=-1)  # [bsz, seq_len, num_layers] experts level mean
+                del router_shift  # Clean up after aggregation
                 
-                # Step 4: Streaming aggregation to minimize peak memory usage
-                router_shift_mean = router_shift.mean(dim=-1)  # [bsz, max_resp_len]
-
-                
-                # Step 5: Log-space geometric mean calculation for numerical stability
+                # Step 6: Log-space geometric mean calculation for numerical stability across layers
                 log_shift = torch.log(torch.clamp(router_shift_mean, min=eps))
+                del router_shift_mean  # Clean up after log computation
+                if self.config.get("router_shift_ratio_geo_mean", False):
+                    log_geom_mean = log_shift.mean(dim=-1)  # [bsz, seq_len] - average over layers
+                else:
+                    log_geom_mean = log_shift.sum(dim=-1)  # [bsz, seq_len] - 层累乘，但不做几何平均
+                router_shift_geometric_mean = torch.exp(log_geom_mean)  # [bsz, seq_len]
 
-                log_geom_mean = log_shift.mean(dim=-1)  # [bsz, max_resp_len]
-                router_shift_geometric_mean = torch.exp(log_geom_mean)  # [bsz, max_resp_len]
-
-                # Apply clipping to router_shift_geometric_mean: clip values < 0.7 to 0 (in-place)
+                # Create clip mask: tokens below threshold need to be clipped
                 clip_threshold = self.config.get("router_shift_clip_threshold", 0.7)
-                clip_mask = router_shift_geometric_mean < clip_threshold
-                router_shift_geometric_mean.masked_fill_(clip_mask, 0.0)
-                del clip_mask
+                router_clip_mask = (router_shift_geometric_mean < clip_threshold) & response_mask
                 
         # Calculate router shift ratio only if we actually computed it
         if router_shift_geometric_mean is not None:
-            # Compute clip fraction after in-place clip: count zeros introduced by clipping
+            # Compute clip fraction: count tokens that need clipping
             import verl.utils.torch_functional as verl_F
-            router_shift_clipfrac = verl_F.masked_mean(
-                (router_shift_geometric_mean == 0).float(),
-                response_mask
-            )
-            metrics["actor/router_shift_clipfrac"] = router_shift_clipfrac.detach().item()
-            
+            if router_clip_mask is not None:
+                router_shift_clipfrac = verl_F.masked_mean(
+                    router_clip_mask.float(),
+                    response_mask
+                )
+                metrics["actor/router_shift_clipfrac"] = router_shift_clipfrac.detach().item()
             
             # Compute mean router shift ratio using aggregation function
             router_shift_ratio = agg_loss(loss_mat=router_shift_geometric_mean, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
@@ -568,12 +583,15 @@ class MegatronPPOActor(BasePPOActor):
             loss_agg_mode=loss_agg_mode,
             use_router_shift=self.config.get("use_router_shift", False),
             router_shift_geometric_mean=router_shift_geometric_mean if self.config.get("use_router_shift", False) else None,
+            router_clip_mask=router_clip_mask if self.config.get("use_router_shift", False) else None,
             config=self.config,
         )
         
         # Clean up router shift tensor after policy loss calculation
         if router_shift_geometric_mean is not None:
             del router_shift_geometric_mean
+        if router_clip_mask is not None:
+            del router_clip_mask
 
         metrics.update(
             {
