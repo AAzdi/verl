@@ -102,7 +102,10 @@ def default_compute_score(
         from . import search_r1_like_qa_em
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
-
+    elif data_source.startswith('codegen'):
+            from . import coder1
+            res = coder1.compute_score(solution_str, ground_truth, extra_info=extra_info)
+        # simulation (code)
     else:
         res = math_verify_reward_function(solution_str, ground_truth)
         # raise NotImplementedError(f"Reward function is not implemented for {data_source=}")

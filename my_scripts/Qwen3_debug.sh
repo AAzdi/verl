@@ -8,7 +8,7 @@ NNODES=${NNODES:-1}
 NGPUS_PER_NODES=${NGPUS_PER_NODES:-8}
 
 project_name='MoE-TTS-Qwen'
-exp_name='Qwen3-MoE-8k-deepscaler-gmpo-clip-0.4-0.4-router-shift-ratio-after-clip-0.9-gmean-B200'
+exp_name='Qwen3-MoE-8k-code-RSPO-clip-0.4-0.4-rsratio-clip-0.8-gmean-B200'
 
 adv_estimator=grpo
 
@@ -22,7 +22,7 @@ use_router_logits=True
 use_router_shift=True
 use_router_kl_loss=False
 router_kl_loss_coef=1.0
-router_shift_clip_threshold=0.9
+router_shift_clip_threshold=0.8
 router_shift_ratio_geo_mean=True
 
 clip_ratio_low=0.4
@@ -42,12 +42,40 @@ train_prompt_mini_bsz=64
 train_ppo_micro_batch_size_per_gpu=1
 infer_ppo_micro_batch_size_per_gpu=1
 # Paths
+
+# =================== Data Mixture ===================
+SHARED_DATA_PATH=/mnt/msranlp/xun/reasoning/reasoning360/datasets/data
+TRAIN_DATA_DIR=${SHARED_DATA_PATH}/train/
+TEST_DATA_DIR=${SHARED_DATA_PATH}/offline_eval/
+
+# Math (train)
+math_train_path=${TRAIN_DATA_DIR}/math__combined_54.4k.parquet
+# Math (test)
+math_test_path=${TEST_DATA_DIR}/math__math_500.parquet
+aime_test_path=${TEST_DATA_DIR}/math__aime_repeated_8x_240.parquet
+amc_test_path=${TEST_DATA_DIR}/math__amc_repeated_4x_332.parquet
+
+# Code (train)
+leetcode_train_path=${TRAIN_DATA_DIR}/codegen__leetcode2k_1.3k_zd.parquet
+livecodebench_train_path=${TRAIN_DATA_DIR}/codegen__livecodebench_440_zd.parquet
+primeintellect_train_path=${TRAIN_DATA_DIR}/codegen__primeintellect_7.5k_zd.parquet
+taco_train_path=${TRAIN_DATA_DIR}/codegen__taco_8.8k_zd.parquet
+# Code (test)
+humaneval_test_path=${TEST_DATA_DIR}/codegen__humaneval_164_zd.parquet
+mbpp_test_path=${TEST_DATA_DIR}/codegen__mbpp_500_zd.parquet
+livecodebench_test_path=${TEST_DATA_DIR}/codegen__livecodebench_279_zd.parquet
+
 MODEL_PATH=/mnt/msranlp/xun/reasoning/MoE-TTS/cpkts/Qwen3/Qwen3-30B-A3B
 DIST_CKPT_PATH=/mnt/msranlp/xun/reasoning/MoE-TTS/cpkts/Qwen3/Qwen3-30B-A3B-mcore
 DEFAULT_LOCAL_DIR=/mnt/dizhang/reasoning/MoE-TTS/Qwen_training_results/deepscaler/Qwen3-MoE/${exp_name}
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-TRAIN_FILE="['./deepscaler/hdfs_data/train.parquet']"
-TEST_FILE="['./deepscaler/hdfs_data/math.parquet']"
+TRAIN_FILE="['${leetcode_train_path}', '${livecodebench_train_path}', '${primeintellect_train_path}', '${taco_train_path}']"  # Use math as example, add to more tasks as needed
+# TRAIN_FILE="['${leetcode_train_path}']"  # Use math as example, add to more tasks as needed
+TEST_FILE="['${humaneval_test_path}', '${mbpp_test_path}']"  # Use math as example, add to more tasks as needed
+
+
+# TRAIN_FILE="['./deepscaler/hdfs_data/train.parquet']"
+# TEST_FILE="['./deepscaler/hdfs_data/math.parquet']"
 
 # Algorithm
 temperature=1.0
